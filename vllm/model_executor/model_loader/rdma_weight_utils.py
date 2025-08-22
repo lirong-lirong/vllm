@@ -54,16 +54,39 @@ def rdma_safetensors_weights_iterator(
     
     logger.info(f"Found {len(weight_files)} weight files for model {model_name}")
     
-    # 3. 从权重文件中提取服务器信息
-    servers = _extract_servers_from_weight_files(etcd_client, weight_files)
+    # 3. 预先获取所有权重文件的元数据，避免在循环中重复访问ETCD
+    file_metadata_cache = {}
+    file_sizes = {}
+    file_server_info = {}
+    
+    for weight_file in weight_files:
+        metadata = _get_weight_file_metadata(etcd_client, weight_file)
+        if metadata:
+            file_metadata_cache[weight_file] = metadata
+            # 提取文件大小
+            file_size = (
+                metadata.get("size") or 
+                metadata.get("Size") or 
+                metadata.get("total_size") or 
+                metadata.get("TotalSize") or
+                1024 * 1024 * 100  # 默认100MB
+            )
+            file_sizes[weight_file] = file_size
+            
+            # 提取服务器信息和偏移量
+            server_info = _extract_server_info_from_metadata(metadata)
+            if server_info:
+                file_server_info[weight_file] = server_info
+    
+    # 4. 从权重文件中提取服务器信息
+    servers = _extract_servers_from_weight_files_with_cache(etcd_client, weight_files, file_metadata_cache)
     if not servers:
         raise RuntimeError("No servers found for weight files")
     
     logger.info(f"Discovered {len(servers)} servers: {servers}")
     
-    # 4. 使用第一个服务器进行连接测试和权重加载
+    # 5. 使用第一个服务器进行连接测试和权重加载
     server_name = servers[0]
-    server_info = {"segment_name": server_name}
     
     logger.info(f"Using server {server_name} for RDMA weight loading")
     
@@ -71,25 +94,18 @@ def rdma_safetensors_weights_iterator(
         logger.info(f"Loading weights from {weight_file} via RDMA")
         
         try:
-            # 1. 从ETCD获取文件大小
-            file_size = _get_file_size_from_etcd(etcd_client, weight_file)
+            # 从缓存中获取文件大小和服务器信息
+            file_size = file_sizes.get(weight_file, 1024 * 1024 * 100)  # 默认100MB
+            server_info = file_server_info.get(weight_file, {"segment_name": server_name})
+            offset = server_info.get("offset", 0)
             
-            # 2. 获取文件的服务器信息和偏移量
-            server_info_with_offset = _get_server_info_from_etcd(etcd_client, weight_file)
-            if server_info_with_offset:
-                actual_server_name = server_info_with_offset.get("segment_name", server_name)
-                offset = server_info_with_offset.get("offset", 0)
-                server_info = {"segment_name": actual_server_name}
-            else:
-                offset = 0
+            # 通过RDMA一次性读取整个文件
+            file_data = _read_weight_range_optimized(rdma_client, server_info, weight_file, offset, file_size)
             
-            # 3. 通过RDMA一次性读取整个文件
-            file_data = _read_weight_range(rdma_client, server_info, weight_file, offset, file_size)
-            
-            # 4. 使用safetensors.load()从内存数据加载所有张量
+            # 使用safetensors.load()从内存数据加载所有张量
             tensors = load(file_data)
             
-            # 5. 产出所有张量（跳过元数据）
+            # 产出所有张量（跳过元数据）
             tensor_count = 0
             for name, tensor in tensors.items():
                 if name != "__metadata__":
@@ -260,6 +276,86 @@ def _extract_servers_from_weight_files(etcd_client, weight_files: List[str]) -> 
     return server_list
 
 
+def _extract_servers_from_weight_files_with_cache(etcd_client, weight_files: List[str], metadata_cache: Dict[str, Dict]) -> List[str]:
+    """从权重文件的元数据中提取服务器信息（使用缓存版本）
+    
+    Args:
+        etcd_client: ETCD客户端实例
+        weight_files: 权重文件列表
+        metadata_cache: 元数据缓存
+        
+    Returns:
+        服务器信息列表
+    """
+    servers = set()  # 使用集合避免重复
+    
+    logger.info("Extracting server information from weight file metadata (cached version)...")
+    
+    # 遍历前几个权重文件以提取服务器信息（通常所有文件的服务器信息是相同的）
+    for i, weight_file_key in enumerate(weight_files[:3]):  # 只检查前3个文件
+        logger.debug(f"  Checking weight file: {weight_file_key}")
+        
+        # 优先使用缓存的元数据
+        metadata = metadata_cache.get(weight_file_key)
+        if not metadata:
+            # 如果缓存中没有，再从ETCD获取
+            metadata = _get_weight_file_metadata(etcd_client, weight_file_key)
+        
+        if metadata:
+            # 尝试从不同的字段中提取服务器信息
+            # 检查shards字段
+            if "shards" in metadata:
+                for shard_idx, shard in enumerate(metadata["shards"]):
+                    logger.debug(f"    Processing shard {shard_idx}...")
+                    # 检查Gold副本
+                    gold = shard.get("gold", [])
+                    for loc_idx, loc in enumerate(gold):
+                        segment_name = loc.get("segment_name")
+                        if segment_name:
+                            servers.add(segment_name)
+                            logger.debug(f"      Found Gold server: {segment_name}")
+                        else:
+                            logger.debug(f"      Gold location {loc_idx} missing segment_name field: {loc}")
+                    
+                    # 检查Replica副本
+                    replicas = shard.get("replica_list", [])
+                    for loc_idx, loc in enumerate(replicas):
+                        segment_name = loc.get("segment_name")
+                        if segment_name:
+                            servers.add(segment_name)
+                            logger.debug(f"      Found Replica server: {segment_name}")
+                        else:
+                            logger.debug(f"      Replica location {loc_idx} missing segment_name field: {loc}")
+            
+            # 检查顶层的gold和replica_list字段
+            gold_list = metadata.get("gold", []) + metadata.get("Gold", [])
+            for loc_idx, loc in enumerate(gold_list):
+                segment_name = loc.get("segment_name") or loc.get("SegmentName")
+                if segment_name:
+                    servers.add(segment_name)
+                    logger.debug(f"    Found top-level Gold server: {segment_name}")
+                else:
+                    logger.debug(f"    Top-level Gold location {loc_idx} missing segment_name field: {loc}")
+                    
+            replica_list = metadata.get("replica_list", []) + metadata.get("ReplicaList", [])
+            for loc_idx, loc in enumerate(replica_list):
+                segment_name = loc.get("segment_name") or loc.get("SegmentName")
+                if segment_name:
+                    servers.add(segment_name)
+                    logger.debug(f"    Found top-level Replica server: {segment_name}")
+                else:
+                    logger.debug(f"    Top-level Replica location {loc_idx} missing segment_name field: {loc}")
+        
+        # 如果已经找到了服务器，可以提前结束
+        if servers:
+            logger.debug(f"  Found {len(servers)} servers, ending search early")
+            break
+    
+    server_list = list(servers)
+    logger.info(f"Discovered {len(server_list)} unique servers: {server_list}")
+    return server_list
+
+
 def _get_file_size_from_etcd(etcd_client, weight_file_key: str) -> int:
     """从ETCD获取文件大小
     
@@ -293,6 +389,49 @@ def _get_file_size_from_etcd(etcd_client, weight_file_key: str) -> int:
         return 1024 * 1024 * 100  # 默认100MB
 
 
+def _extract_server_info_from_metadata(metadata: Dict) -> Optional[Dict]:
+    """从元数据中提取服务器信息和偏移量
+    
+    Args:
+        metadata: 权重文件元数据
+        
+    Returns:
+        包含服务器信息和偏移量的字典，如果未找到则返回None
+    """
+    if not metadata:
+        return None
+        
+    server_info = {}
+    
+    # 检查 shards 字段
+    if "shards" in metadata and metadata["shards"]:
+        # 获取第一个分片的信息
+        first_shard = metadata["shards"][0]
+        
+        # 直接使用Replica副本信息，避免复杂的Gold优先逻辑
+        if "replica_list" in first_shard and first_shard["replica_list"]:
+            replica_info = first_shard["replica_list"][0]
+            if "segment_name" in replica_info:
+                server_info["segment_name"] = replica_info["segment_name"]
+            if "offset" in replica_info:
+                server_info["offset"] = replica_info["offset"]
+        # 如果没有Replica副本，才检查Gold副本
+        elif "gold" in first_shard and first_shard["gold"]:
+            gold_info = first_shard["gold"][0]
+            if "segment_name" in gold_info:
+                server_info["segment_name"] = gold_info["segment_name"]
+            if "offset" in gold_info:
+                server_info["offset"] = gold_info["offset"]
+    
+    # 检查顶层字段
+    if "segment_name" in metadata:
+        server_info["segment_name"] = metadata["segment_name"]
+    if "offset" in metadata:
+        server_info["offset"] = metadata["offset"]
+    
+    return server_info if server_info else None
+
+
 def _get_server_info_from_etcd(etcd_client, weight_file_key: str) -> Optional[Dict]:
     """从ETCD获取服务器信息和偏移量
     
@@ -308,35 +447,7 @@ def _get_server_info_from_etcd(etcd_client, weight_file_key: str) -> Optional[Di
     try:
         metadata = _get_weight_file_metadata(etcd_client, weight_file_key)
         if metadata:
-            # 尝试从不同字段获取服务器信息
-            server_info = {}
-            
-            # 检查 shards 字段
-            if "shards" in metadata and metadata["shards"]:
-                # 获取第一个分片的信息
-                first_shard = metadata["shards"][0]
-                
-                # 检查Gold副本获取服务器地址和偏移量
-                if "gold" in first_shard and first_shard["gold"]:
-                    gold_info = first_shard["gold"][0]
-                    if "segment_name" in gold_info:
-                        server_info["segment_name"] = gold_info["segment_name"]
-                    if "offset" in gold_info:
-                        server_info["offset"] = gold_info["offset"]
-                # 如果没有Gold副本，检查Replica副本
-                elif "replica_list" in first_shard and first_shard["replica_list"]:
-                    replica_info = first_shard["replica_list"][0]
-                    if "segment_name" in replica_info:
-                        server_info["segment_name"] = replica_info["segment_name"]
-                    if "offset" in replica_info:
-                        server_info["offset"] = replica_info["offset"]
-            
-            # 检查顶层字段
-            if "segment_name" in metadata:
-                server_info["segment_name"] = metadata["segment_name"]
-            if "offset" in metadata:
-                server_info["offset"] = metadata["offset"]
-            
+            server_info = _extract_server_info_from_metadata(metadata)
             if server_info:
                 logger.debug(f"Server info for {weight_file_key}: {server_info}")
                 return server_info
@@ -351,14 +462,57 @@ def _get_server_info_from_etcd(etcd_client, weight_file_key: str) -> Optional[Di
         return None
 
 
-def _read_weight_range(
+# 全局预注册缓冲区（实验性优化）
+_pre_registered_buffer = None
+_pre_registered_buffer_size = 0
+_pre_registered_buffer_ptr = 0
+
+
+def _initialize_pre_registered_buffer(rdma_client: Any, size: int = 8 * 1024 * 1024 * 1024):
+    """初始化预注册缓冲区（实验性优化）
+    
+    Args:
+        rdma_client: Mooncake Transfer Engine client
+        size: 缓冲区大小，默认8GB
+    """
+    global _pre_registered_buffer, _pre_registered_buffer_size, _pre_registered_buffer_ptr
+    
+    if _pre_registered_buffer is not None:
+        return  # 已经初始化过了
+    
+    try:
+        import numpy as np
+        logger.info(f"Initializing pre-registered buffer of size {size} bytes ({size / (1024*1024*1024):.2f} GB)")
+        
+        # 预分配缓冲区
+        _pre_registered_buffer = np.empty(size, dtype=np.uint8)
+        _pre_registered_buffer_ptr = _pre_registered_buffer.ctypes.data
+        _pre_registered_buffer_size = size
+        
+        # 注册内存
+        ret = rdma_client.register_memory(_pre_registered_buffer_ptr, size)
+        if ret != 0:
+            logger.warning(f"Failed to register memory for pre-registered buffer, falling back to managed buffers. Return code: {ret}")
+            _pre_registered_buffer = None
+            _pre_registered_buffer_size = 0
+            _pre_registered_buffer_ptr = 0
+        else:
+            logger.info("Successfully initialized pre-registered buffer")
+    except Exception as e:
+        logger.warning(f"Failed to initialize pre-registered buffer, falling back to managed buffers: {e}")
+        _pre_registered_buffer = None
+        _pre_registered_buffer_size = 0
+        _pre_registered_buffer_ptr = 0
+
+
+def _read_weight_range_optimized(
     rdma_client: Any,
     server_info: Dict[str, Any],
     file_path: str,
     offset: int,
     length: int
 ) -> bytes:
-    """Read a range of data from a remote file via RDMA.
+    """优化版本的读取远程文件数据范围函数，使用预注册缓冲区避免重复内存注册和二次拷贝
     
     Args:
         rdma_client: Mooncake Transfer Engine client
@@ -376,8 +530,41 @@ def _read_weight_range(
         return b""
     
     server_name = server_info.get("segment_name", "localhost")
-    logger.debug(f"Reading {length} bytes from {file_path} at offset {offset} on server {server_name}")
+    logger.debug(f"Reading {length} bytes from {file_path} at offset {offset} on server {server_name} (optimized version)")
     
+    # 尝试初始化预注册缓冲区
+    _initialize_pre_registered_buffer(rdma_client)
+    
+    # 如果预注册缓冲区可用且足够大，使用它
+    global _pre_registered_buffer, _pre_registered_buffer_size, _pre_registered_buffer_ptr
+    
+    if _pre_registered_buffer is not None and _pre_registered_buffer_size >= length:
+        try:
+            logger.debug(f"Using pre-registered buffer of size {_pre_registered_buffer_size} for RDMA read")
+            
+            # Use the offset as the remote buffer address
+            remote_buffer_addr = offset
+            
+            # Perform RDMA read using mooncake engine API directly into pre-registered buffer
+            ret = rdma_client.transfer_sync_read(
+                server_name,
+                _pre_registered_buffer_ptr,
+                remote_buffer_addr,
+                length
+            )
+            
+            if ret != 0:
+                raise RuntimeError(f"RDMA read failed for {file_path} offset {offset} length {length} with code {ret}")
+            
+            # 直接从预注册缓冲区返回数据，避免二次拷贝
+            # 注意：这里我们创建一个bytes对象的视图，而不是拷贝数据
+            data = _pre_registered_buffer[:length].tobytes()
+            logger.debug(f"Successfully read {len(data)} bytes from {file_path} using pre-registered buffer")
+            return data
+        except Exception as e:
+            logger.warning(f"Failed to use pre-registered buffer, falling back to managed buffers: {e}")
+    
+    # 回退到原始的托管缓冲区方法
     try:
         # Allocate managed buffer
         buffer_addr = rdma_client.allocate_managed_buffer(length)
@@ -412,3 +599,26 @@ def _read_weight_range(
     except Exception as e:
         logger.error(f"Failed to read weight range from {file_path} on server {server_name}: {e}")
         raise
+
+
+def _read_weight_range(
+    rdma_client: Any,
+    server_info: Dict[str, Any],
+    file_path: str,
+    offset: int,
+    length: int
+) -> bytes:
+    """Read a range of data from a remote file via RDMA.
+    
+    Args:
+        rdma_client: Mooncake Transfer Engine client
+        server_info: Server information
+        file_path: Path to the file
+        offset: Offset in the file to start reading
+        length: Number of bytes to read
+        
+    Returns:
+        The data read from the file as bytes
+    """
+    # 使用优化版本
+    return _read_weight_range_optimized(rdma_client, server_info, file_path, offset, length)
