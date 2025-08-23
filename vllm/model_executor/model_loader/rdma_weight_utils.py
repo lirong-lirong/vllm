@@ -10,6 +10,7 @@ import torch
 from safetensors.torch import load
 
 from vllm.logger import init_logger
+from vllm.model_executor.model_loader.rdma_buffer_manager import RDMABufferManager
 
 logger = init_logger(__name__)
 
@@ -43,17 +44,24 @@ def rdma_safetensors_weights_iterator(
     
     # 从环境变量获取配置
     use_async = os.getenv("VLLM_RDMA_ASYNC_LOADING", "false").lower() in ("true", "1", "yes")
+    use_batch = os.getenv("VLLM_RDMA_BATCH_LOADING", "false").lower() in ("true", "1", "yes")
     pipeline_window_size = int(os.getenv("VLLM_RDMA_PIPELINE_WINDOW_SIZE", "3"))
     
     logger.info(f"Starting RDMA weight loading for model: {model_name}")
-    logger.info(f"Async loading: {use_async}, Pipeline window size: {pipeline_window_size}")
+    logger.info(f"Async loading: {use_async}, Batch loading: {use_batch}, Pipeline window size: {pipeline_window_size}")
     
     # 初始化RDMA加载
     init_result = _initialize_rdma_loading(etcd_host, etcd_port, model_name)
     etcd_client, weight_files, file_metadata_cache, file_sizes, file_server_info, server_name = init_result
     
+    # 如果启用批量下载，使用批量下载实现
+    if use_batch:
+        yield from _load_weights_batch(
+            rdma_client, weight_files, file_sizes, file_server_info, 
+            server_name
+        )
     # 如果不使用异步加载，回退到原来的同步实现
-    if not use_async:
+    elif not use_async:
         yield from _load_weights_sync(
             rdma_client, weight_files, file_sizes, file_server_info, 
             server_name
@@ -142,23 +150,34 @@ def _load_weights_sync(
     """
     import time
     
-    total_bytes = 0
-    total_time = 0.0
+    # 记录初始化缓冲区时间
+    init_start_time = time.perf_counter()
     
     # 为同步加载初始化单个预注册缓冲区（窗口大小为1）
     max_file_size = max(file_sizes.values()) if file_sizes else 1024 * 1024 * 100
-    buffers, _ = _initialize_persistent_buffer(rdma_client, max_file_size, 1)
+    # 创建缓冲区管理器实例
+    buffer_manager = RDMABufferManager()
+    buffer_manager.initialize(rdma_client, max_file_size, 1)
+    buffers = buffer_manager.buffers
     sync_buffer = buffers[0]
-    sync_buffer_ptr = _persistent_buffer_ptrs[0]
+    sync_buffer_ptr = buffer_manager.buffer_ptrs[0]
+    
+    init_end_time = time.perf_counter()
+    init_time = init_end_time - init_start_time
+    _log_performance_metrics("Buffer initialization", 0, init_time)
     
     logger.info(f"Using shared buffer of size {max_file_size} bytes ({max_file_size / (1024*1024*1024):.2f} GB) for sync loading")
+    
+    total_bytes = 0
+    total_transfer_time = 0.0
+    total_load_time = 0.0
     
     for weight_file in weight_files:
         logger.info(f"Loading weights from {weight_file} via RDMA (sync with pre-registered buffer)")
         
         try:
             # 记录开始时间
-            start_time = time.time()
+            transfer_start_time = time.perf_counter()
             
             # 从缓存中获取文件大小和服务器信息
             file_size = file_sizes.get(weight_file, 1024 * 1024 * 100)  # 默认100MB
@@ -169,17 +188,24 @@ def _load_weights_sync(
             file_data = _read_weight_range_optimized(rdma_client, server_info, weight_file, offset, file_size, sync_buffer, sync_buffer_ptr)
             
             # 记录结束时间和计算带宽
-            end_time = time.time()
-            transfer_time = end_time - start_time
-            total_time += transfer_time
+            transfer_end_time = time.perf_counter()
+            transfer_time = transfer_end_time - transfer_start_time
+            total_transfer_time += transfer_time
             total_bytes += len(file_data)
             
-            if transfer_time > 0:
-                bandwidth = _calculate_bandwidth(len(file_data), transfer_time)
-                logger.info(f"File {weight_file} transfer bandwidth: {bandwidth:.2f} GB/s")
+            _log_performance_metrics("File transfer", len(file_data), transfer_time, f"file: {weight_file}")
+            
+            # 记录safetensors.load()时间
+            load_start_time = time.perf_counter()
             
             # 使用safetensors.load()从内存数据加载所有张量
             tensors = load(file_data)
+            
+            load_end_time = time.perf_counter()
+            load_time = load_end_time - load_start_time
+            total_load_time += load_time
+            
+            _log_performance_metrics("File load", len(file_data), load_time, f"file: {weight_file}")
             
             # 产出所有张量（跳过元数据）
             tensor_count = 0
@@ -192,11 +218,13 @@ def _load_weights_sync(
         except Exception as e:
             logger.error(f"Failed to load weights from {weight_file}: {e}")
             raise
+        finally:
+            # 清理缓冲区管理器
+            buffer_manager.cleanup()
     
     # 计算总体带宽
-    if total_time > 0:
-        overall_bandwidth = _calculate_bandwidth(total_bytes, total_time)
-        logger.info(f"Overall sync loading bandwidth: {overall_bandwidth:.2f} GB/s")
+    _log_performance_metrics("Overall sync loading transfer", total_bytes, total_transfer_time)
+    _log_performance_metrics("Overall sync loading load", total_bytes, total_load_time)
 
 
 # 异步读取任务状态
@@ -240,48 +268,28 @@ def _calculate_bandwidth(bytes_transferred: int, time_seconds: float) -> float:
     return (bytes_transferred / (1024 * 1024 * 1024)) / time_seconds
 
 
-# 全局预注册缓冲区管理
-_persistent_buffers = []  # 存储预注册内存缓冲区numpy数组
-_persistent_buffer_ptrs = []  # 存储预注册内存缓冲区地址的数组
-_max_file_size = 0
-_pipeline_window_size = 0
-_buffer_initialized = False
+def _log_performance_metrics(operation: str, bytes_transferred: int, time_seconds: float, additional_info: str = ""):
+    """记录性能指标
+    
+    Args:
+        operation: 操作名称
+        bytes_transferred: 传输的字节数
+        time_seconds: 花费的时间（秒）
+        additional_info: 附加信息
+    """
+    if time_seconds > 0:
+        bandwidth = _calculate_bandwidth(bytes_transferred, time_seconds)
+        if additional_info:
+            logger.info(f"{operation} bandwidth: {bandwidth:.2f} GB/s, time spent: {time_seconds:.2f} seconds, {additional_info}")
+        else:
+            logger.info(f"{operation} bandwidth: {bandwidth:.2f} GB/s, time spent: {time_seconds:.2f} seconds")
+    else:
+        if additional_info:
+            logger.info(f"{operation} time spent: {time_seconds:.2f} seconds, {additional_info}")
+        else:
+            logger.info(f"{operation} time spent: {time_seconds:.2f} seconds")
 
 
-def _initialize_persistent_buffer(rdma_client: Any, max_file_size: int, pipeline_window_size: int):
-    """初始化持久化预注册缓冲区"""
-    global _persistent_buffers, _persistent_buffer_ptrs, _max_file_size, _pipeline_window_size, _buffer_initialized
-    
-    # 对于一个迭代器实例，我们只需要初始化一次
-    if _buffer_initialized:
-        return _persistent_buffers, _max_file_size
-    
-    _max_file_size = max_file_size
-    _pipeline_window_size = pipeline_window_size
-    
-    try:
-        import numpy as np
-        # 为每个流水线槽位分配单独的缓冲区，并将numpy数组和地址存储在数组中
-        _persistent_buffers = []
-        _persistent_buffer_ptrs = []
-        for i in range(_pipeline_window_size):
-            # 预分配缓冲区
-            buffer = np.empty(_max_file_size, dtype=np.uint8)
-            buffer_ptr = buffer.ctypes.data
-            
-            # 注册内存
-            ret = rdma_client.register_memory(buffer_ptr, _max_file_size)
-            if ret != 0:
-                raise RuntimeError(f"Failed to register memory for persistent buffer slot {i}, return code: {ret}")
-            
-            _persistent_buffers.append(buffer)
-            _persistent_buffer_ptrs.append(buffer_ptr)
-    except Exception as e:
-        raise RuntimeError(f"Failed to allocate and register persistent buffer of size {_max_file_size} for {_pipeline_window_size} slots: {e}")
-    
-    _buffer_initialized = True
-    logger.info(f"Initialized {_pipeline_window_size} persistent buffers of size {_max_file_size} bytes each ({_max_file_size / (1024*1024*1024):.2f} GB each)")
-    return _persistent_buffers, _max_file_size
 
 
 def _load_weights_async(
@@ -298,16 +306,30 @@ def _load_weights_async(
     """
     import time
     
+    # 记录初始化缓冲区时间
+    init_start_time = time.perf_counter()
+    
     # 初始化持久化缓冲区
     max_file_size = max(file_sizes.values()) if file_sizes else 1024 * 1024 * 100
-    buffers, _ = _initialize_persistent_buffer(
-        rdma_client, max_file_size, pipeline_window_size
-    )
+    # 创建缓冲区管理器实例
+    buffer_manager = RDMABufferManager()
+    try:
+        buffer_manager.initialize(rdma_client, max_file_size, pipeline_window_size)
+        buffers = buffer_manager.buffers
+    except Exception as e:
+        raise RuntimeError(f"Failed to initialize buffer manager for async loading: {e}")
+    
+    init_end_time = time.perf_counter()
+    init_time = init_end_time - init_start_time
+    _log_performance_metrics("Buffer initialization", 0, init_time)
     
     # 预取队列，存储异步读取任务
     prefetch_queue = []
     
     # 初始化预取队列
+    init_transfer_start_time = time.perf_counter()
+    init_transfer_bytes = 0
+    
     for i in range(min(pipeline_window_size, len(weight_files))):
         weight_file = weight_files[i]
         file_size = file_sizes.get(weight_file, 1024 * 1024 * 100)
@@ -315,7 +337,7 @@ def _load_weights_async(
         offset = server_info.get("offset", 0)
         
         # 直接从数组中获取缓冲区地址
-        buffer_ptr = _persistent_buffer_ptrs[i]
+        buffer_ptr = buffer_manager.buffer_ptrs[i]
         
         # 提交异步读取请求（使用优化版本）
         try:
@@ -332,107 +354,124 @@ def _load_weights_async(
                 length=length,
                 server_info=server_info
             ))
+            init_transfer_bytes += length
         except Exception as e:
             logger.error(f"Failed to submit async read request for {weight_file}: {e}")
+            # 清理缓冲区管理器
+            buffer_manager.cleanup()
             # 错误情况下不需要释放缓冲区，因为使用的是预注册的大块内存
             raise
+    
+    init_transfer_end_time = time.perf_counter()
+    init_transfer_time = init_transfer_end_time - init_transfer_start_time
+    _log_performance_metrics("Initial async transfer", init_transfer_bytes, init_transfer_time)
     
     # 处理所有权重文件
     next_prefetch_index = pipeline_window_size
     total_bytes = 0
-    total_time = 0.0
+    total_transfer_time = 0.0
+    total_load_time = 0.0
     
-    for i in range(len(weight_files)):
-        # 获取当前文件的预取结果
-        if not prefetch_queue:
-            logger.error("Prefetch queue is empty unexpectedly")
-            raise RuntimeError("Prefetch queue is empty unexpectedly")
-            
-        current_task = prefetch_queue.pop(0)
-        weight_file = current_task.weight_file
-        batch_id = current_task.batch_id
-        buffer_index = current_task.buffer_index  # 使用缓冲区索引
-        length = current_task.length
-        server_info = current_task.server_info
-        
-        logger.info(f"Processing weights from {weight_file} via RDMA (async optimized)")
-        
-        try:
-            # 记录开始时间
-            start_time = time.time()
-            
-            # 等待当前文件传输完成（使用优化版本）
-            _wait_for_async_read_completion_optimized(
-                rdma_client, batch_id
-            )
-            
-            # 直接从预注册缓冲区numpy数组返回数据视图，避免二次拷贝
-            buffer = _persistent_buffers[buffer_index]
-            file_data = buffer[:length].tobytes()
-            
-            # 记录结束时间和计算带宽
-            end_time = time.time()
-            transfer_time = end_time - start_time
-            total_time += transfer_time
-            total_bytes += len(file_data)
-            
-            if transfer_time > 0:
-                bandwidth = _calculate_bandwidth(len(file_data), transfer_time)
-                logger.info(f"File {weight_file} transfer bandwidth: {bandwidth:.2f} GB/s, time spend: {transfer_time:.2f}")
+    try:
+        for i in range(len(weight_files)):
+            # 获取当前文件的预取结果
+            if not prefetch_queue:
+                logger.error("Prefetch queue is empty unexpectedly")
+                raise RuntimeError("Prefetch queue is empty unexpectedly")
                 
-            start_time = time.time()
-            # 使用safetensors.load()从内存数据加载所有张量
-            tensors = load(file_data)
-            end_time = time.time()
-            bandwidth = _calculate_bandwidth(len(file_data), end_time - start_time)
-            logger.info(f"File {weight_file} load bandwidth: {bandwidth:.2f} GB/s, time spend: {end_time - start_time:.2f}")
+            current_task = prefetch_queue.pop(0)
+            weight_file = current_task.weight_file
+            batch_id = current_task.batch_id
+            buffer_index = current_task.buffer_index  # 使用缓冲区索引
+            length = current_task.length
+            server_info = current_task.server_info
             
-            # 产出所有张量（跳过元数据）
-            tensor_count = 0
-            for name, tensor in tensors.items():
-                if name != "__metadata__":
-                    yield name, tensor
-                    tensor_count += 1
+            logger.info(f"Processing weights from {weight_file} via RDMA (async optimized)")
             
-            logger.info(f"Loaded {tensor_count} tensors from {weight_file}")
-            
-            # 如果还有文件需要预取，提交新的异步读取请求
-            if next_prefetch_index < len(weight_files):
-                next_weight_file = weight_files[next_prefetch_index]
-                file_size = file_sizes.get(next_weight_file, 1024 * 1024 * 100)
-                next_server_info = file_server_info.get(next_weight_file, {"segment_name": server_name})
-                offset = next_server_info.get("offset", 0)
+            try:
+                # 记录开始时间
+                transfer_start_time = time.perf_counter()
                 
-                # 直接从数组中获取缓冲区地址
-                buffer_index = next_prefetch_index % pipeline_window_size
-                buffer_ptr = _persistent_buffer_ptrs[buffer_index]
+                # 等待当前文件传输完成（使用优化版本）
+                _wait_for_async_read_completion_optimized(
+                    rdma_client, batch_id
+                )
                 
-                # 提交异步读取请求（使用优化版本）
-                try:
-                    batch_id, returned_buffer_addr, length = _read_weight_range_async_optimized(
-                        rdma_client, next_server_info, next_weight_file, offset, file_size,
-                        buffer_ptr
-                    )
+                # 直接从预注册缓冲区numpy数组返回数据视图，避免二次拷贝
+                buffer = buffer_manager.buffers[buffer_index]
+                file_data = buffer[:length].tobytes()
+                
+                # 记录结束时间和计算带宽
+                transfer_end_time = time.perf_counter()
+                transfer_time = transfer_end_time - transfer_start_time
+                total_transfer_time += transfer_time
+                total_bytes += len(file_data)
+                
+                _log_performance_metrics("File transfer", len(file_data), transfer_time, f"file: {weight_file}")
+                
+                # 记录safetensors.load()时间
+                load_start_time = time.perf_counter()
+                
+                # 使用safetensors.load()从内存数据加载所有张量
+                tensors = load(file_data)
+                
+                load_end_time = time.perf_counter()
+                load_time = load_end_time - load_start_time
+                total_load_time += load_time
+                
+                _log_performance_metrics("File load", len(file_data), load_time, f"file: {weight_file}")
+                
+                # 产出所有张量（跳过元数据）
+                tensor_count = 0
+                for name, tensor in tensors.items():
+                    if name != "__metadata__":
+                        yield name, tensor
+                        tensor_count += 1
+                
+                logger.info(f"Loaded {tensor_count} tensors from {weight_file}")
+                
+                # 如果还有文件需要预取，提交新的异步读取请求
+                if next_prefetch_index < len(weight_files):
+                    next_weight_file = weight_files[next_prefetch_index]
+                    file_size = file_sizes.get(next_weight_file, 1024 * 1024 * 100)
+                    next_server_info = file_server_info.get(next_weight_file, {"segment_name": server_name})
+                    offset = next_server_info.get("offset", 0)
                     
-                    prefetch_queue.append(AsyncReadTaskOptimized(
-                        weight_file=next_weight_file,
-                        batch_id=batch_id,
-                        buffer_addr=returned_buffer_addr,
-                        buffer_index=buffer_index,  # 存储缓冲区索引而不是地址
-                        length=length,
-                        server_info=next_server_info
-                    ))
-                except Exception as e:
-                    logger.error(f"Failed to submit async read request for {next_weight_file}: {e}")
-                    raise
-                
-                next_prefetch_index += 1
-                
-        except Exception as e:
-            logger.error(f"Failed to load weights from {weight_file}: {e}")
-            raise
+                    # 直接从数组中获取缓冲区地址
+                    buffer_index = next_prefetch_index % pipeline_window_size
+                    buffer_ptr = buffer_manager.buffer_ptrs[buffer_index]
+                    
+                    # 提交异步读取请求（使用优化版本）
+                    try:
+                        batch_id, returned_buffer_addr, length = _read_weight_range_async_optimized(
+                            rdma_client, next_server_info, next_weight_file, offset, file_size,
+                            buffer_ptr
+                        )
+                        
+                        prefetch_queue.append(AsyncReadTaskOptimized(
+                            weight_file=next_weight_file,
+                            batch_id=batch_id,
+                            buffer_addr=returned_buffer_addr,
+                            buffer_index=buffer_index,  # 存储缓冲区索引而不是地址
+                            length=length,
+                            server_info=next_server_info
+                        ))
+                    except Exception as e:
+                        logger.error(f"Failed to submit async read request for {next_weight_file}: {e}")
+                        raise
+                    
+                    next_prefetch_index += 1
+                    
+            except Exception as e:
+                logger.error(f"Failed to load weights from {weight_file}: {e}")
+                raise
+    finally:
+        # 清理缓冲区管理器
+        buffer_manager.cleanup()
     
     # 计算总体带宽
+    _log_performance_metrics("Overall async loading transfer", total_bytes, total_transfer_time)
+    _log_performance_metrics("Overall async loading load", total_bytes, total_load_time)
 
 
 def _read_weight_range_async_optimized(rdma_client, server_info, file_path, offset, length, 
@@ -713,3 +752,168 @@ def _extract_servers_from_weight_files_with_cache(etcd_client, weight_files: Lis
     server_list = list(servers)
     logger.info(f"Discovered {len(server_list)} unique servers: {server_list}")
     return server_list
+
+
+def _load_weights_batch(
+    rdma_client: Any,
+    weight_files: List[str],
+    file_sizes: Dict[str, int],
+    file_server_info: Dict[str, Dict],
+    server_name: str
+) -> Generator[Tuple[str, torch.Tensor], None, None]:
+    """批量加载权重文件（在初始化时并行下载所有文件）
+    
+    Yields:
+        Tuples of (weight_name, weight_tensor)
+    """
+    import time
+    from collections import defaultdict
+    
+    logger.info("Starting batch weight loading (parallel downloading all files)")
+    
+    # 记录初始化缓冲区时间
+    init_start_time = time.perf_counter()
+    
+    # 获取最大文件大小
+    max_file_size = max(file_sizes.values()) if file_sizes else 1024 * 1024 * 100
+    num_files = len(weight_files)
+    
+    logger.info(f"Max file size: {max_file_size / (1024*1024*1024):.2f} GB, Number of files: {num_files}")
+    
+    # 初始化缓冲区管理器，为每个文件创建一个缓冲区
+    buffer_manager = RDMABufferManager()
+    try:
+        buffer_manager.initialize(rdma_client, max_file_size, num_files)
+        buffers = buffer_manager.buffers
+        buffer_ptrs = buffer_manager.buffer_ptrs
+    except Exception as e:
+        logger.error(f"Failed to initialize buffer manager for batch loading: {e}")
+        raise RuntimeError(f"Failed to initialize buffer manager for batch loading: {e}")
+    
+    init_end_time = time.perf_counter()
+    init_time = init_end_time - init_start_time
+    _log_performance_metrics("Buffer initialization", 0, init_time)
+    
+    try:
+        # 按服务器分组文件
+        server_file_groups = defaultdict(list)
+        total_bytes = 0
+        
+        for i, weight_file in enumerate(weight_files):
+            # 从缓存中获取文件大小和服务器信息
+            file_size = file_sizes.get(weight_file, 1024 * 1024 * 100)  # 默认100MB
+            server_info = file_server_info.get(weight_file, {"segment_name": server_name})
+            server_name_actual = server_info.get("segment_name", server_name)
+            
+            server_file_groups[server_name_actual].append({
+                "index": i,
+                "weight_file": weight_file,
+                "file_size": file_size,
+                "offset": server_info.get("offset", 0)
+            })
+            total_bytes += file_size
+        
+        # 为每个服务器提交批量读取请求
+        batch_ids = []
+        
+        transfer_start_time = time.perf_counter()
+        
+        for server_name_actual, file_group in server_file_groups.items():
+            # 为当前服务器准备批量请求
+            local_buffer_addrs = []
+            remote_buffer_addrs = []
+            lengths = []
+            
+            for file_info in file_group:
+                index = file_info["index"]
+                file_size = file_info["file_size"]
+                offset = file_info["offset"]
+                
+                # 获取对应缓冲区的地址
+                buffer_ptr = buffer_ptrs[index]
+                
+                # 添加到批量请求列表
+                local_buffer_addrs.append(buffer_ptr)
+                remote_buffer_addrs.append(offset)
+                lengths.append(file_size)
+            
+            # 使用批量异步读取接口提交当前服务器的请求
+            logger.info(f"Submitting batch read request for {len(file_group)} files from server {server_name_actual}")
+            
+            batch_id = rdma_client.batch_transfer_async_read(
+                server_name_actual,
+                local_buffer_addrs,
+                remote_buffer_addrs,
+                lengths
+            )
+            
+            if batch_id <= 0:
+                raise RuntimeError(f"Failed to submit batch read request for server {server_name_actual}")
+            
+            batch_ids.append(batch_id)
+        
+        # 等待所有文件传输完成
+        logger.info("Waiting for all files to be downloaded...")
+        for batch_id in batch_ids:
+            while True:
+                status = rdma_client.get_batch_transfer_status([batch_id])
+                if status == 0:  # 传输成功完成
+                    break
+                elif status < 0:  # 传输失败
+                    raise RuntimeError(f"Batch read failed with status {status}")
+                time.sleep(0.001)  # 1ms
+        
+        transfer_end_time = time.perf_counter()
+        transfer_time = transfer_end_time - transfer_start_time
+        
+        _log_performance_metrics("Batch download", total_bytes, transfer_time)
+        
+        # 处理所有下载的文件数据
+        total_load_time = 0.0
+        load_total_bytes = 0
+        
+        for weight_file in weight_files:
+            # 找到对应的缓冲区索引
+            file_index = weight_files.index(weight_file)
+            file_size = file_sizes.get(weight_file, 1024 * 1024 * 100)  # 默认100MB
+            
+            logger.info(f"Loading tensors from {weight_file}")
+            
+            try:
+                # 直接从预注册缓冲区numpy数组返回数据视图，避免二次拷贝
+                buffer = buffers[file_index]
+                file_data = buffer[:file_size].tobytes()
+                
+                # 记录safetensors.load()时间
+                load_start_time = time.perf_counter()
+                
+                # 使用safetensors.load()从内存数据加载所有张量
+                tensors = load(file_data)
+                
+                load_end_time = time.perf_counter()
+                load_time = load_end_time - load_start_time
+                total_load_time += load_time
+                load_total_bytes += len(file_data)
+                
+                _log_performance_metrics("File load", len(file_data), load_time, f"file: {weight_file}")
+                
+                # 产出所有张量（跳过元数据）
+                tensor_count = 0
+                for name, tensor in tensors.items():
+                    if name != "__metadata__":
+                        yield name, tensor
+                        tensor_count += 1
+                
+                logger.info(f"Loaded {tensor_count} tensors from {weight_file}")
+            except Exception as e:
+                logger.error(f"Failed to load tensors from {weight_file}: {e}")
+                raise
+        
+        # 记录总体加载时间
+        _log_performance_metrics("Overall batch loading", load_total_bytes, total_load_time)
+                
+    finally:
+        # 清理缓冲区管理器
+        buffer_manager.cleanup()
+        
+    logger.info("Completed batch weight loading")

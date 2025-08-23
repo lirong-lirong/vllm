@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import os
+import time
 from collections.abc import Generator
 from typing import Optional
 
@@ -80,6 +81,8 @@ class RDMARemoteLoader(DefaultModelLoader):
                 etcd_host = metadata_server
                 etcd_port = 2379
             
+            if self.counter_before_loading_weights == 0.0:
+                self.counter_before_loading_weights = time.perf_counter()
             yield from rdma_safetensors_weights_iterator(
                 source.model_or_path, 
                 self.mooncake_client,
