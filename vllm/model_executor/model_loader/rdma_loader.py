@@ -201,8 +201,10 @@ class RDMARemoteLoader(DefaultModelLoader):
         """Cleanup Mooncake client."""
         if hasattr(self, 'mooncake_client') and self.mooncake_client:
             try:
-                logger.info("Shutting down Mooncake client...")
-                self.mooncake_client.shutdown()
-                logger.info("Mooncake client shutdown successfully")
+                logger.info("Cleaning up Mooncake client...")
+                # TransferEngine typically doesn't need explicit shutdown
+                # Just remove the reference to allow garbage collection
+                self.mooncake_client = None
+                logger.info("Mooncake client cleaned up successfully")
             except Exception as e:
-                logger.error(f"Error shutting down Mooncake client: {e}")
+                logger.error(f"Error cleaning up Mooncake client: {e}")

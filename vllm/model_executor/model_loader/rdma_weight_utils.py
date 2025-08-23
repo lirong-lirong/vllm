@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Utilities for loading model weights via RDMA directly from remote storage."""
 import json
+import os
 from collections.abc import Generator
 from typing import Dict, Any, Tuple, List, Optional
 
@@ -26,7 +27,7 @@ def rdma_safetensors_weights_iterator(
     etcd_host: str = "localhost",
     etcd_port: int = 2379,
 ) -> Generator[Tuple[str, torch.Tensor], None, None]:
-    """使用safetensors.load()从RDMA读取的数据加载权重
+    """使用safetensors.load()从RDMA读取的数据加载权重（支持异步流水线处理）
     
     Args:
         model_name: 模型名称
@@ -40,8 +41,43 @@ def rdma_safetensors_weights_iterator(
     if not ETCD_AVAILABLE:
         raise RuntimeError("ETCD library not available. Cannot discover model weights.")
     
-    logger.info(f"Starting RDMA weight loading for model: {model_name}")
+    # 从环境变量获取配置
+    use_async = os.getenv("VLLM_RDMA_ASYNC_LOADING", "false").lower() in ("true", "1", "yes")
+    pipeline_window_size = int(os.getenv("VLLM_RDMA_PIPELINE_WINDOW_SIZE", "3"))
     
+    logger.info(f"Starting RDMA weight loading for model: {model_name}")
+    logger.info(f"Async loading: {use_async}, Pipeline window size: {pipeline_window_size}")
+    
+    # 初始化RDMA加载
+    init_result = _initialize_rdma_loading(etcd_host, etcd_port, model_name)
+    etcd_client, weight_files, file_metadata_cache, file_sizes, file_server_info, server_name = init_result
+    
+    # 如果不使用异步加载，回退到原来的同步实现
+    if not use_async:
+        yield from _load_weights_sync(
+            rdma_client, weight_files, file_sizes, file_server_info, 
+            server_name
+        )
+    else:
+        # 异步流水线处理实现
+        yield from _load_weights_async(
+            rdma_client, weight_files, file_sizes, file_server_info, 
+            server_name, pipeline_window_size
+        )
+    
+    logger.info(f"Completed RDMA weight loading for model: {model_name}")
+
+
+def _initialize_rdma_loading(
+    etcd_host: str, 
+    etcd_port: int, 
+    model_name: str
+) -> Tuple[Any, List[str], Dict[str, Dict], Dict[str, int], Dict[str, Dict], str]:
+    """初始化RDMA加载过程
+    
+    Returns:
+        Tuple of (etcd_client, weight_files, file_metadata_cache, file_sizes, file_server_info, server_name)
+    """
     # 1. 连接到ETCD
     etcd_client = _connect_to_etcd(etcd_host, etcd_port)
     if not etcd_client:
@@ -87,20 +123,60 @@ def rdma_safetensors_weights_iterator(
     
     # 5. 使用第一个服务器进行连接测试和权重加载
     server_name = servers[0]
-    
     logger.info(f"Using server {server_name} for RDMA weight loading")
     
+    return etcd_client, weight_files, file_metadata_cache, file_sizes, file_server_info, server_name
+
+
+def _load_weights_sync(
+    rdma_client: Any,
+    weight_files: List[str],
+    file_sizes: Dict[str, int],
+    file_server_info: Dict[str, Dict],
+    server_name: str
+) -> Generator[Tuple[str, torch.Tensor], None, None]:
+    """同步加载权重文件（强制使用预注册内存）
+    
+    Yields:
+        Tuples of (weight_name, weight_tensor)
+    """
+    import time
+    
+    total_bytes = 0
+    total_time = 0.0
+    
+    # 为同步加载初始化单个预注册缓冲区（窗口大小为1）
+    max_file_size = max(file_sizes.values()) if file_sizes else 1024 * 1024 * 100
+    buffers, _ = _initialize_persistent_buffer(rdma_client, max_file_size, 1)
+    sync_buffer = buffers[0]
+    sync_buffer_ptr = _persistent_buffer_ptrs[0]
+    
+    logger.info(f"Using shared buffer of size {max_file_size} bytes ({max_file_size / (1024*1024*1024):.2f} GB) for sync loading")
+    
     for weight_file in weight_files:
-        logger.info(f"Loading weights from {weight_file} via RDMA")
+        logger.info(f"Loading weights from {weight_file} via RDMA (sync with pre-registered buffer)")
         
         try:
+            # 记录开始时间
+            start_time = time.time()
+            
             # 从缓存中获取文件大小和服务器信息
             file_size = file_sizes.get(weight_file, 1024 * 1024 * 100)  # 默认100MB
             server_info = file_server_info.get(weight_file, {"segment_name": server_name})
             offset = server_info.get("offset", 0)
             
-            # 通过RDMA一次性读取整个文件
-            file_data = _read_weight_range_optimized(rdma_client, server_info, weight_file, offset, file_size)
+            # 强制使用预注册内存的方法读取数据
+            file_data = _read_weight_range_optimized(rdma_client, server_info, weight_file, offset, file_size, sync_buffer, sync_buffer_ptr)
+            
+            # 记录结束时间和计算带宽
+            end_time = time.time()
+            transfer_time = end_time - start_time
+            total_time += transfer_time
+            total_bytes += len(file_data)
+            
+            if transfer_time > 0:
+                bandwidth = _calculate_bandwidth(len(file_data), transfer_time)
+                logger.info(f"File {weight_file} transfer bandwidth: {bandwidth:.2f} GB/s")
             
             # 使用safetensors.load()从内存数据加载所有张量
             tensors = load(file_data)
@@ -117,7 +193,324 @@ def rdma_safetensors_weights_iterator(
             logger.error(f"Failed to load weights from {weight_file}: {e}")
             raise
     
-    logger.info(f"Completed RDMA weight loading for model: {model_name}")
+    # 计算总体带宽
+    if total_time > 0:
+        overall_bandwidth = _calculate_bandwidth(total_bytes, total_time)
+        logger.info(f"Overall sync loading bandwidth: {overall_bandwidth:.2f} GB/s")
+
+
+# 异步读取任务状态
+class AsyncReadTaskOptimized:
+    def __init__(self, weight_file, batch_id, buffer_addr, buffer_index, length, server_info):
+        self.weight_file = weight_file
+        self.batch_id = batch_id
+        self.buffer_addr = buffer_addr
+        self.buffer_index = buffer_index
+        self.length = length
+        self.server_info = server_info
+
+
+def _wait_for_async_read_completion_optimized(rdma_client, batch_id):
+    """优化的等待异步读取完成函数，避免二次拷贝"""
+    import time
+    
+    # 轮询等待传输完成
+    while True:
+        status = rdma_client.get_batch_transfer_status([batch_id])
+        if status == 0:  # 传输成功完成
+            break
+        elif status < 0:  # 传输失败
+            raise RuntimeError(f"Async read failed with status {status}")
+        time.sleep(0.001)  # 1ms
+
+
+def _calculate_bandwidth(bytes_transferred: int, time_seconds: float) -> float:
+    """计算带宽 (GB/s)
+    
+    Args:
+        bytes_transferred: 传输的字节数
+        time_seconds: 传输所用的时间（秒）
+        
+    Returns:
+        带宽 (GB/s)
+    """
+    if time_seconds <= 0:
+        return 0.0
+    # 转换为GB/s: bytes / (1024^3) / seconds
+    return (bytes_transferred / (1024 * 1024 * 1024)) / time_seconds
+
+
+# 全局预注册缓冲区管理
+_persistent_buffers = []  # 存储预注册内存缓冲区numpy数组
+_persistent_buffer_ptrs = []  # 存储预注册内存缓冲区地址的数组
+_max_file_size = 0
+_pipeline_window_size = 0
+_buffer_initialized = False
+
+
+def _initialize_persistent_buffer(rdma_client: Any, max_file_size: int, pipeline_window_size: int):
+    """初始化持久化预注册缓冲区"""
+    global _persistent_buffers, _persistent_buffer_ptrs, _max_file_size, _pipeline_window_size, _buffer_initialized
+    
+    # 对于一个迭代器实例，我们只需要初始化一次
+    if _buffer_initialized:
+        return _persistent_buffers, _max_file_size
+    
+    _max_file_size = max_file_size
+    _pipeline_window_size = pipeline_window_size
+    
+    try:
+        import numpy as np
+        # 为每个流水线槽位分配单独的缓冲区，并将numpy数组和地址存储在数组中
+        _persistent_buffers = []
+        _persistent_buffer_ptrs = []
+        for i in range(_pipeline_window_size):
+            # 预分配缓冲区
+            buffer = np.empty(_max_file_size, dtype=np.uint8)
+            buffer_ptr = buffer.ctypes.data
+            
+            # 注册内存
+            ret = rdma_client.register_memory(buffer_ptr, _max_file_size)
+            if ret != 0:
+                raise RuntimeError(f"Failed to register memory for persistent buffer slot {i}, return code: {ret}")
+            
+            _persistent_buffers.append(buffer)
+            _persistent_buffer_ptrs.append(buffer_ptr)
+    except Exception as e:
+        raise RuntimeError(f"Failed to allocate and register persistent buffer of size {_max_file_size} for {_pipeline_window_size} slots: {e}")
+    
+    _buffer_initialized = True
+    logger.info(f"Initialized {_pipeline_window_size} persistent buffers of size {_max_file_size} bytes each ({_max_file_size / (1024*1024*1024):.2f} GB each)")
+    return _persistent_buffers, _max_file_size
+
+
+def _load_weights_async(
+    rdma_client: Any,
+    weight_files: List[str],
+    file_sizes: Dict[str, int],
+    file_server_info: Dict[str, Dict],
+    server_name: str,
+    pipeline_window_size: int
+) -> Generator[Tuple[str, torch.Tensor], None, None]:
+    """异步加载权重文件（优化版）
+    Yields:
+        Tuples of (weight_name, weight_tensor)
+    """
+    import time
+    
+    # 初始化持久化缓冲区
+    max_file_size = max(file_sizes.values()) if file_sizes else 1024 * 1024 * 100
+    buffers, _ = _initialize_persistent_buffer(
+        rdma_client, max_file_size, pipeline_window_size
+    )
+    
+    # 预取队列，存储异步读取任务
+    prefetch_queue = []
+    
+    # 初始化预取队列
+    for i in range(min(pipeline_window_size, len(weight_files))):
+        weight_file = weight_files[i]
+        file_size = file_sizes.get(weight_file, 1024 * 1024 * 100)
+        server_info = file_server_info.get(weight_file, {"segment_name": server_name})
+        offset = server_info.get("offset", 0)
+        
+        # 直接从数组中获取缓冲区地址
+        buffer_ptr = _persistent_buffer_ptrs[i]
+        
+        # 提交异步读取请求（使用优化版本）
+        try:
+            batch_id, returned_buffer_addr, length = _read_weight_range_async_optimized(
+                rdma_client, server_info, weight_file, offset, file_size,
+                buffer_ptr
+            )
+            
+            prefetch_queue.append(AsyncReadTaskOptimized(
+                weight_file=weight_file,
+                batch_id=batch_id,
+                buffer_addr=returned_buffer_addr,
+                buffer_index=i,  # 存储缓冲区索引而不是地址
+                length=length,
+                server_info=server_info
+            ))
+        except Exception as e:
+            logger.error(f"Failed to submit async read request for {weight_file}: {e}")
+            # 错误情况下不需要释放缓冲区，因为使用的是预注册的大块内存
+            raise
+    
+    # 处理所有权重文件
+    next_prefetch_index = pipeline_window_size
+    total_bytes = 0
+    total_time = 0.0
+    
+    for i in range(len(weight_files)):
+        # 获取当前文件的预取结果
+        if not prefetch_queue:
+            logger.error("Prefetch queue is empty unexpectedly")
+            raise RuntimeError("Prefetch queue is empty unexpectedly")
+            
+        current_task = prefetch_queue.pop(0)
+        weight_file = current_task.weight_file
+        batch_id = current_task.batch_id
+        buffer_index = current_task.buffer_index  # 使用缓冲区索引
+        length = current_task.length
+        server_info = current_task.server_info
+        
+        logger.info(f"Processing weights from {weight_file} via RDMA (async optimized)")
+        
+        try:
+            # 记录开始时间
+            start_time = time.time()
+            
+            # 等待当前文件传输完成（使用优化版本）
+            _wait_for_async_read_completion_optimized(
+                rdma_client, batch_id
+            )
+            
+            # 直接从预注册缓冲区numpy数组返回数据视图，避免二次拷贝
+            buffer = _persistent_buffers[buffer_index]
+            file_data = buffer[:length].tobytes()
+            
+            # 记录结束时间和计算带宽
+            end_time = time.time()
+            transfer_time = end_time - start_time
+            total_time += transfer_time
+            total_bytes += len(file_data)
+            
+            if transfer_time > 0:
+                bandwidth = _calculate_bandwidth(len(file_data), transfer_time)
+                logger.info(f"File {weight_file} transfer bandwidth: {bandwidth:.2f} GB/s, time spend: {transfer_time:.2f}")
+                
+            start_time = time.time()
+            # 使用safetensors.load()从内存数据加载所有张量
+            tensors = load(file_data)
+            end_time = time.time()
+            bandwidth = _calculate_bandwidth(len(file_data), end_time - start_time)
+            logger.info(f"File {weight_file} load bandwidth: {bandwidth:.2f} GB/s, time spend: {end_time - start_time:.2f}")
+            
+            # 产出所有张量（跳过元数据）
+            tensor_count = 0
+            for name, tensor in tensors.items():
+                if name != "__metadata__":
+                    yield name, tensor
+                    tensor_count += 1
+            
+            logger.info(f"Loaded {tensor_count} tensors from {weight_file}")
+            
+            # 如果还有文件需要预取，提交新的异步读取请求
+            if next_prefetch_index < len(weight_files):
+                next_weight_file = weight_files[next_prefetch_index]
+                file_size = file_sizes.get(next_weight_file, 1024 * 1024 * 100)
+                next_server_info = file_server_info.get(next_weight_file, {"segment_name": server_name})
+                offset = next_server_info.get("offset", 0)
+                
+                # 直接从数组中获取缓冲区地址
+                buffer_index = next_prefetch_index % pipeline_window_size
+                buffer_ptr = _persistent_buffer_ptrs[buffer_index]
+                
+                # 提交异步读取请求（使用优化版本）
+                try:
+                    batch_id, returned_buffer_addr, length = _read_weight_range_async_optimized(
+                        rdma_client, next_server_info, next_weight_file, offset, file_size,
+                        buffer_ptr
+                    )
+                    
+                    prefetch_queue.append(AsyncReadTaskOptimized(
+                        weight_file=next_weight_file,
+                        batch_id=batch_id,
+                        buffer_addr=returned_buffer_addr,
+                        buffer_index=buffer_index,  # 存储缓冲区索引而不是地址
+                        length=length,
+                        server_info=next_server_info
+                    ))
+                except Exception as e:
+                    logger.error(f"Failed to submit async read request for {next_weight_file}: {e}")
+                    raise
+                
+                next_prefetch_index += 1
+                
+        except Exception as e:
+            logger.error(f"Failed to load weights from {weight_file}: {e}")
+            raise
+    
+    # 计算总体带宽
+
+
+def _read_weight_range_async_optimized(rdma_client, server_info, file_path, offset, length, 
+                                     buffer_ptr):
+    """优化的异步读取函数，使用预注册内存"""
+    server_name = server_info.get("segment_name", "localhost")
+    remote_buffer_addr = offset
+    
+    # 使用预注册内存的准确地址
+    local_buffer_addr = buffer_ptr
+    
+    # 提交异步读取请求
+    batch_id = rdma_client.batch_transfer_async_read(
+        server_name,
+        [local_buffer_addr],    # 使用预注册内存的准确地址
+        [remote_buffer_addr],   # 远程地址不变
+        [length]                # 长度不变
+    )
+    
+    if batch_id <= 0:
+        raise RuntimeError(f"Failed to submit async read request for {file_path}")
+    
+    return batch_id, local_buffer_addr, length  # 返回实际使用的缓冲区地址
+
+
+def _read_weight_range_optimized(
+    rdma_client: Any,
+    server_info: Dict[str, Any],
+    file_path: str,
+    offset: int,
+    length: int,
+    buffer: Any,
+    buffer_ptr: int
+) -> bytes:
+    """优化版本的读取远程文件数据范围函数，使用预注册缓冲区避免重复内存注册和二次拷贝
+    
+    Args:
+        rdma_client: Mooncake Transfer Engine client
+        server_info: Server information
+        file_path: Path to the file
+        offset: Offset in the file to start reading
+        length: Number of bytes to read
+        buffer: Pre-allocated numpy buffer
+        buffer_ptr: Pointer to the pre-allocated buffer
+        
+    Returns:
+        The data read from the file as bytes
+    """
+    # Validate inputs
+    if length <= 0:
+        logger.warning(f"Requested to read {length} bytes from {file_path}, returning empty data")
+        return b""
+    
+    server_name = server_info.get("segment_name", "localhost")
+    logger.debug(f"Reading {length} bytes from {file_path} at offset {offset} on server {server_name} (optimized version)")
+    
+    try:
+        # Use the offset as the remote buffer address
+        remote_buffer_addr = offset
+        
+        # Perform RDMA read using mooncake engine API directly into pre-registered buffer
+        ret = rdma_client.transfer_sync_read(
+            server_name,
+            buffer_ptr,
+            remote_buffer_addr,
+            length
+        )
+        
+        if ret != 0:
+            raise RuntimeError(f"RDMA read failed for {file_path} offset {offset} length {length} with code {ret}")
+        
+        # 直接从预注册缓冲区返回数据，避免二次拷贝
+        data = buffer[:length].tobytes()
+        logger.debug(f"Successfully read {len(data)} bytes from {file_path} using pre-registered buffer")
+        return data
+    except Exception as e:
+        logger.error(f"Failed to read weight range from {file_path} on server {server_name}: {e}")
+        raise
 
 
 def _connect_to_etcd(etcd_host: str, etcd_port: int):
@@ -138,7 +531,6 @@ def _connect_to_etcd(etcd_host: str, etcd_port: int):
     except Exception as e:
         logger.error(f"ETCD connection failed: {e}")
         return None
-
 
 def _get_model_weight_files(etcd_client, model_name: str) -> List[str]:
     """从ETCD获取模型的所有权重文件
@@ -201,80 +593,47 @@ def _get_weight_file_metadata(etcd_client, weight_file_key: str) -> Optional[Dic
         logger.error(f"Error querying weight file metadata: {e}")
         return None
 
-
-def _extract_servers_from_weight_files(etcd_client, weight_files: List[str]) -> List[str]:
-    """从权重文件的元数据中提取服务器信息
+def _extract_server_info_from_metadata(metadata: Dict) -> Optional[Dict]:
+    """从元数据中提取服务器信息和偏移量
     
     Args:
-        etcd_client: ETCD客户端实例
-        weight_files: 权重文件列表
+        metadata: 权重文件元数据
         
     Returns:
-        服务器信息列表
+        包含服务器信息和偏移量的字典，如果未找到则返回None
     """
-    servers = set()  # 使用集合避免重复
-    
-    logger.info("Extracting server information from weight file metadata...")
-    
-    # 遍历前几个权重文件以提取服务器信息（通常所有文件的服务器信息是相同的）
-    for i, weight_file_key in enumerate(weight_files[:3]):  # 只检查前3个文件
-        logger.debug(f"  Checking weight file: {weight_file_key}")
-        metadata = _get_weight_file_metadata(etcd_client, weight_file_key)
+    if not metadata:
+        return None
         
-        if metadata:
-            # 尝试从不同的字段中提取服务器信息
-            # 检查shards字段
-            if "shards" in metadata:
-                for shard_idx, shard in enumerate(metadata["shards"]):
-                    logger.debug(f"    Processing shard {shard_idx}...")
-                    # 检查Gold副本
-                    gold = shard.get("gold", [])
-                    for loc_idx, loc in enumerate(gold):
-                        segment_name = loc.get("segment_name")
-                        if segment_name:
-                            servers.add(segment_name)
-                            logger.debug(f"      Found Gold server: {segment_name}")
-                        else:
-                            logger.debug(f"      Gold location {loc_idx} missing segment_name field: {loc}")
-                    
-                    # 检查Replica副本
-                    replicas = shard.get("replica_list", [])
-                    for loc_idx, loc in enumerate(replicas):
-                        segment_name = loc.get("segment_name")
-                        if segment_name:
-                            servers.add(segment_name)
-                            logger.debug(f"      Found Replica server: {segment_name}")
-                        else:
-                            logger.debug(f"      Replica location {loc_idx} missing segment_name field: {loc}")
-            
-            # 检查顶层的gold和replica_list字段
-            gold_list = metadata.get("gold", []) + metadata.get("Gold", [])
-            for loc_idx, loc in enumerate(gold_list):
-                segment_name = loc.get("segment_name") or loc.get("SegmentName")
-                if segment_name:
-                    servers.add(segment_name)
-                    logger.debug(f"    Found top-level Gold server: {segment_name}")
-                else:
-                    logger.debug(f"    Top-level Gold location {loc_idx} missing segment_name field: {loc}")
-                    
-            replica_list = metadata.get("replica_list", []) + metadata.get("ReplicaList", [])
-            for loc_idx, loc in enumerate(replica_list):
-                segment_name = loc.get("segment_name") or loc.get("SegmentName")
-                if segment_name:
-                    servers.add(segment_name)
-                    logger.debug(f"    Found top-level Replica server: {segment_name}")
-                else:
-                    logger.debug(f"    Top-level Replica location {loc_idx} missing segment_name field: {loc}")
-        
-        # 如果已经找到了服务器，可以提前结束
-        if servers:
-            logger.debug(f"  Found {len(servers)} servers, ending search early")
-            break
+    server_info = {}
     
-    server_list = list(servers)
-    logger.info(f"Discovered {len(server_list)} unique servers: {server_list}")
-    return server_list
-
+    # 检查 shards 字段
+    if "shards" in metadata and metadata["shards"]:
+        # 获取第一个分片的信息
+        first_shard = metadata["shards"][0]
+        
+        # 直接使用Replica副本信息，避免复杂的Gold优先逻辑
+        if "replica_list" in first_shard and first_shard["replica_list"]:
+            replica_info = first_shard["replica_list"][0]
+            if "segment_name" in replica_info:
+                server_info["segment_name"] = replica_info["segment_name"]
+            if "offset" in replica_info:
+                server_info["offset"] = replica_info["offset"]
+        # 如果没有Replica副本，才检查Gold副本
+        elif "gold" in first_shard and first_shard["gold"]:
+            gold_info = first_shard["gold"][0]
+            if "segment_name" in gold_info:
+                server_info["segment_name"] = gold_info["segment_name"]
+            if "offset" in gold_info:
+                server_info["offset"] = gold_info["offset"]
+    
+    # 检查顶层字段
+    if "segment_name" in metadata:
+        server_info["segment_name"] = metadata["segment_name"]
+    if "offset" in metadata:
+        server_info["offset"] = metadata["offset"]
+    
+    return server_info if server_info else None
 
 def _extract_servers_from_weight_files_with_cache(etcd_client, weight_files: List[str], metadata_cache: Dict[str, Dict]) -> List[str]:
     """从权重文件的元数据中提取服务器信息（使用缓存版本）
@@ -354,271 +713,3 @@ def _extract_servers_from_weight_files_with_cache(etcd_client, weight_files: Lis
     server_list = list(servers)
     logger.info(f"Discovered {len(server_list)} unique servers: {server_list}")
     return server_list
-
-
-def _get_file_size_from_etcd(etcd_client, weight_file_key: str) -> int:
-    """从ETCD获取文件大小
-    
-    Args:
-        etcd_client: ETCD客户端实例
-        weight_file_key: 权重文件的键
-        
-    Returns:
-        文件大小（字节）
-    """
-    logger.debug(f"Getting file size from ETCD for {weight_file_key}")
-    
-    try:
-        metadata = _get_weight_file_metadata(etcd_client, weight_file_key)
-        if metadata:
-            # 尝试从不同字段获取文件大小
-            file_size = (
-                metadata.get("size") or 
-                metadata.get("Size") or 
-                metadata.get("total_size") or 
-                metadata.get("TotalSize") or
-                1024 * 1024 * 100  # 默认100MB
-            )
-            logger.debug(f"File size for {weight_file_key}: {file_size} bytes")
-            return file_size
-        else:
-            logger.warning(f"Could not get metadata for {weight_file_key}, using default size")
-            return 1024 * 1024 * 100  # 默认100MB
-    except Exception as e:
-        logger.error(f"Error getting file size from ETCD: {e}")
-        return 1024 * 1024 * 100  # 默认100MB
-
-
-def _extract_server_info_from_metadata(metadata: Dict) -> Optional[Dict]:
-    """从元数据中提取服务器信息和偏移量
-    
-    Args:
-        metadata: 权重文件元数据
-        
-    Returns:
-        包含服务器信息和偏移量的字典，如果未找到则返回None
-    """
-    if not metadata:
-        return None
-        
-    server_info = {}
-    
-    # 检查 shards 字段
-    if "shards" in metadata and metadata["shards"]:
-        # 获取第一个分片的信息
-        first_shard = metadata["shards"][0]
-        
-        # 直接使用Replica副本信息，避免复杂的Gold优先逻辑
-        if "replica_list" in first_shard and first_shard["replica_list"]:
-            replica_info = first_shard["replica_list"][0]
-            if "segment_name" in replica_info:
-                server_info["segment_name"] = replica_info["segment_name"]
-            if "offset" in replica_info:
-                server_info["offset"] = replica_info["offset"]
-        # 如果没有Replica副本，才检查Gold副本
-        elif "gold" in first_shard and first_shard["gold"]:
-            gold_info = first_shard["gold"][0]
-            if "segment_name" in gold_info:
-                server_info["segment_name"] = gold_info["segment_name"]
-            if "offset" in gold_info:
-                server_info["offset"] = gold_info["offset"]
-    
-    # 检查顶层字段
-    if "segment_name" in metadata:
-        server_info["segment_name"] = metadata["segment_name"]
-    if "offset" in metadata:
-        server_info["offset"] = metadata["offset"]
-    
-    return server_info if server_info else None
-
-
-def _get_server_info_from_etcd(etcd_client, weight_file_key: str) -> Optional[Dict]:
-    """从ETCD获取服务器信息和偏移量
-    
-    Args:
-        etcd_client: ETCD客户端实例
-        weight_file_key: 权重文件的键
-        
-    Returns:
-        包含服务器信息和偏移量的字典，如果未找到则返回None
-    """
-    logger.debug(f"Getting server info from ETCD for {weight_file_key}")
-    
-    try:
-        metadata = _get_weight_file_metadata(etcd_client, weight_file_key)
-        if metadata:
-            server_info = _extract_server_info_from_metadata(metadata)
-            if server_info:
-                logger.debug(f"Server info for {weight_file_key}: {server_info}")
-                return server_info
-            else:
-                logger.warning(f"Could not extract server info from metadata for {weight_file_key}")
-                return None
-        else:
-            logger.warning(f"Could not get metadata for {weight_file_key}")
-            return None
-    except Exception as e:
-        logger.error(f"Error getting server info from ETCD: {e}")
-        return None
-
-
-# 全局预注册缓冲区（实验性优化）
-_pre_registered_buffer = None
-_pre_registered_buffer_size = 0
-_pre_registered_buffer_ptr = 0
-
-
-def _initialize_pre_registered_buffer(rdma_client: Any, size: int = 8 * 1024 * 1024 * 1024):
-    """初始化预注册缓冲区（实验性优化）
-    
-    Args:
-        rdma_client: Mooncake Transfer Engine client
-        size: 缓冲区大小，默认8GB
-    """
-    global _pre_registered_buffer, _pre_registered_buffer_size, _pre_registered_buffer_ptr
-    
-    if _pre_registered_buffer is not None:
-        return  # 已经初始化过了
-    
-    try:
-        import numpy as np
-        logger.info(f"Initializing pre-registered buffer of size {size} bytes ({size / (1024*1024*1024):.2f} GB)")
-        
-        # 预分配缓冲区
-        _pre_registered_buffer = np.empty(size, dtype=np.uint8)
-        _pre_registered_buffer_ptr = _pre_registered_buffer.ctypes.data
-        _pre_registered_buffer_size = size
-        
-        # 注册内存
-        ret = rdma_client.register_memory(_pre_registered_buffer_ptr, size)
-        if ret != 0:
-            logger.warning(f"Failed to register memory for pre-registered buffer, falling back to managed buffers. Return code: {ret}")
-            _pre_registered_buffer = None
-            _pre_registered_buffer_size = 0
-            _pre_registered_buffer_ptr = 0
-        else:
-            logger.info("Successfully initialized pre-registered buffer")
-    except Exception as e:
-        logger.warning(f"Failed to initialize pre-registered buffer, falling back to managed buffers: {e}")
-        _pre_registered_buffer = None
-        _pre_registered_buffer_size = 0
-        _pre_registered_buffer_ptr = 0
-
-
-def _read_weight_range_optimized(
-    rdma_client: Any,
-    server_info: Dict[str, Any],
-    file_path: str,
-    offset: int,
-    length: int
-) -> bytes:
-    """优化版本的读取远程文件数据范围函数，使用预注册缓冲区避免重复内存注册和二次拷贝
-    
-    Args:
-        rdma_client: Mooncake Transfer Engine client
-        server_info: Server information
-        file_path: Path to the file
-        offset: Offset in the file to start reading
-        length: Number of bytes to read
-        
-    Returns:
-        The data read from the file as bytes
-    """
-    # Validate inputs
-    if length <= 0:
-        logger.warning(f"Requested to read {length} bytes from {file_path}, returning empty data")
-        return b""
-    
-    server_name = server_info.get("segment_name", "localhost")
-    logger.debug(f"Reading {length} bytes from {file_path} at offset {offset} on server {server_name} (optimized version)")
-    
-    # 尝试初始化预注册缓冲区
-    _initialize_pre_registered_buffer(rdma_client)
-    
-    # 如果预注册缓冲区可用且足够大，使用它
-    global _pre_registered_buffer, _pre_registered_buffer_size, _pre_registered_buffer_ptr
-    
-    if _pre_registered_buffer is not None and _pre_registered_buffer_size >= length:
-        try:
-            logger.debug(f"Using pre-registered buffer of size {_pre_registered_buffer_size} for RDMA read")
-            
-            # Use the offset as the remote buffer address
-            remote_buffer_addr = offset
-            
-            # Perform RDMA read using mooncake engine API directly into pre-registered buffer
-            ret = rdma_client.transfer_sync_read(
-                server_name,
-                _pre_registered_buffer_ptr,
-                remote_buffer_addr,
-                length
-            )
-            
-            if ret != 0:
-                raise RuntimeError(f"RDMA read failed for {file_path} offset {offset} length {length} with code {ret}")
-            
-            # 直接从预注册缓冲区返回数据，避免二次拷贝
-            # 注意：这里我们创建一个bytes对象的视图，而不是拷贝数据
-            data = _pre_registered_buffer[:length].tobytes()
-            logger.debug(f"Successfully read {len(data)} bytes from {file_path} using pre-registered buffer")
-            return data
-        except Exception as e:
-            logger.warning(f"Failed to use pre-registered buffer, falling back to managed buffers: {e}")
-    
-    # 回退到原始的托管缓冲区方法
-    try:
-        # Allocate managed buffer
-        buffer_addr = rdma_client.allocate_managed_buffer(length)
-        if buffer_addr == 0:
-            raise RuntimeError(f"Failed to allocate managed buffer of size {length}")
-        
-        logger.debug(f"Allocated buffer at address {buffer_addr}")
-        
-        try:
-            # Use the offset as the remote buffer address
-            remote_buffer_addr = offset
-            
-            # Perform RDMA read using mooncake engine API
-            ret = rdma_client.transfer_sync_read(
-                server_name,
-                buffer_addr,
-                remote_buffer_addr,
-                length
-            )
-            
-            if ret != 0:
-                raise RuntimeError(f"RDMA read failed for {file_path} offset {offset} length {length} with code {ret}")
-            
-            # Read bytes from buffer
-            data = rdma_client.read_bytes_from_buffer(buffer_addr, length)
-            logger.debug(f"Successfully read {len(data)} bytes from {file_path}")
-            return data
-        finally:
-            # Free the buffer
-            rdma_client.free_managed_buffer(buffer_addr, length)
-            logger.debug(f"Freed buffer at address {buffer_addr}")
-    except Exception as e:
-        logger.error(f"Failed to read weight range from {file_path} on server {server_name}: {e}")
-        raise
-
-
-def _read_weight_range(
-    rdma_client: Any,
-    server_info: Dict[str, Any],
-    file_path: str,
-    offset: int,
-    length: int
-) -> bytes:
-    """Read a range of data from a remote file via RDMA.
-    
-    Args:
-        rdma_client: Mooncake Transfer Engine client
-        server_info: Server information
-        file_path: Path to the file
-        offset: Offset in the file to start reading
-        length: Number of bytes to read
-        
-    Returns:
-        The data read from the file as bytes
-    """
-    # 使用优化版本
-    return _read_weight_range_optimized(rdma_client, server_info, file_path, offset, length)
