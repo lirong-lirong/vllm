@@ -244,6 +244,7 @@ def _wait_for_async_read_completion_optimized(rdma_client, batch_id):
     
     # 轮询等待传输完成
     while True:
+        logger.info("wait")
         status = rdma_client.get_batch_transfer_status([batch_id])
         if status == 0:  # 传输成功完成
             break
@@ -305,6 +306,7 @@ def _load_weights_async(
         Tuples of (weight_name, weight_tensor)
     """
     import time
+    from collections import deque
     
     # 记录初始化缓冲区时间
     init_start_time = time.perf_counter()
@@ -323,13 +325,14 @@ def _load_weights_async(
     init_time = init_end_time - init_start_time
     _log_performance_metrics("Buffer initialization", 0, init_time)
     
-    # 预取队列，存储异步读取任务
-    prefetch_queue = []
+    # 使用双端队列存储正在进行的任务
+    active_tasks = deque()
     
-    # 初始化预取队列
+    # 初始化流水线：提交初始的预取请求
     init_transfer_start_time = time.perf_counter()
     init_transfer_bytes = 0
     
+    # 提交初始窗口大小的异步读取请求
     for i in range(min(pipeline_window_size, len(weight_files))):
         weight_file = weight_files[i]
         file_size = file_sizes.get(weight_file, 1024 * 1024 * 100)
@@ -346,7 +349,7 @@ def _load_weights_async(
                 buffer_ptr
             )
             
-            prefetch_queue.append(AsyncReadTaskOptimized(
+            active_tasks.append(AsyncReadTaskOptimized(
                 weight_file=weight_file,
                 batch_id=batch_id,
                 buffer_addr=returned_buffer_addr,
@@ -367,19 +370,16 @@ def _load_weights_async(
     _log_performance_metrics("Initial async transfer", init_transfer_bytes, init_transfer_time)
     
     # 处理所有权重文件
-    next_prefetch_index = pipeline_window_size
+    next_submit_index = pipeline_window_size
     total_bytes = 0
     total_transfer_time = 0.0
     total_load_time = 0.0
     
     try:
-        for i in range(len(weight_files)):
-            # 获取当前文件的预取结果
-            if not prefetch_queue:
-                logger.error("Prefetch queue is empty unexpectedly")
-                raise RuntimeError("Prefetch queue is empty unexpectedly")
-                
-            current_task = prefetch_queue.pop(0)
+        # 继续处理直到所有任务完成
+        while active_tasks:
+            # 获取最早提交的任务
+            current_task = active_tasks.popleft()
             weight_file = current_task.weight_file
             batch_id = current_task.batch_id
             buffer_index = current_task.buffer_index  # 使用缓冲区索引
@@ -397,7 +397,6 @@ def _load_weights_async(
                     rdma_client, batch_id
                 )
                 
-                # 直接从预注册缓冲区numpy数组返回数据视图，避免二次拷贝
                 buffer = buffer_manager.buffers[buffer_index]
                 file_data = buffer[:length].tobytes()
                 
@@ -431,14 +430,15 @@ def _load_weights_async(
                 logger.info(f"Loaded {tensor_count} tensors from {weight_file}")
                 
                 # 如果还有文件需要预取，提交新的异步读取请求
-                if next_prefetch_index < len(weight_files):
-                    next_weight_file = weight_files[next_prefetch_index]
+                # 这样就实现了真正的流水线：在处理当前文件的同时，下一个文件已经在传输中
+                if next_submit_index < len(weight_files):
+                    next_weight_file = weight_files[next_submit_index]
                     file_size = file_sizes.get(next_weight_file, 1024 * 1024 * 100)
                     next_server_info = file_server_info.get(next_weight_file, {"segment_name": server_name})
                     offset = next_server_info.get("offset", 0)
                     
                     # 直接从数组中获取缓冲区地址
-                    buffer_index = next_prefetch_index % pipeline_window_size
+                    buffer_index = next_submit_index % pipeline_window_size
                     buffer_ptr = buffer_manager.buffer_ptrs[buffer_index]
                     
                     # 提交异步读取请求（使用优化版本）
@@ -448,7 +448,8 @@ def _load_weights_async(
                             buffer_ptr
                         )
                         
-                        prefetch_queue.append(AsyncReadTaskOptimized(
+                        # 将新任务添加到队列末尾
+                        active_tasks.append(AsyncReadTaskOptimized(
                             weight_file=next_weight_file,
                             batch_id=batch_id,
                             buffer_addr=returned_buffer_addr,
@@ -460,7 +461,7 @@ def _load_weights_async(
                         logger.error(f"Failed to submit async read request for {next_weight_file}: {e}")
                         raise
                     
-                    next_prefetch_index += 1
+                    next_submit_index += 1
                     
             except Exception as e:
                 logger.error(f"Failed to load weights from {weight_file}: {e}")
