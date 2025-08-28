@@ -95,36 +95,57 @@ def _initialize_rdma_loading(
     if not etcd_client:
         raise RuntimeError(f"Failed to connect to ETCD at {etcd_host}:{etcd_port}")
     
-    # 2. 获取模型的所有权重文件
-    weight_files = _get_model_weight_files(etcd_client, model_name)
+    # 2. & 3. 一次性获取所有权重文件及其元数据以减少ETCD调用
+    logger.info(f"Querying weight files and metadata for model '{model_name}'...")
+    file_metadata_cache = {}
+    file_sizes = {}
+    file_server_info = {}
+    weight_files = []
+
+    try:
+        prefix = f"mooncake/checkpoint/{model_name}"
+        # 一次RPC调用获取所有相关键值对
+        for value, meta in etcd_client.get_prefix(prefix):
+            if not (meta and hasattr(meta, 'key')):
+                continue
+            
+            key_str = meta.key.decode('utf-8')
+            if not key_str.endswith('.safetensors'):
+                continue
+
+            weight_files.append(key_str)
+            try:
+                metadata = json.loads(value.decode('utf-8'))
+                file_metadata_cache[key_str] = metadata
+                
+                # 提取文件大小
+                file_size = (
+                    metadata.get("size") or 
+                    metadata.get("Size") or 
+                    metadata.get("total_size") or 
+                    metadata.get("TotalSize") or
+                    1024 * 1024 * 100  # 默认100MB
+                )
+                file_sizes[key_str] = file_size
+                
+                # 提取服务器信息和偏移量
+                server_info = _extract_server_info_from_metadata(metadata)
+                if server_info:
+                    file_server_info[key_str] = server_info
+
+            except json.JSONDecodeError as e:
+                logger.warning(f"Failed to decode JSON metadata for key '{key_str}': {e}")
+            except Exception as e:
+                logger.error(f"Error processing metadata for key '{key_str}': {e}")
+
+    except Exception as e:
+        logger.error(f"Error querying weight files from ETCD: {e}")
+        raise
+
     if not weight_files:
         raise RuntimeError(f"No weight files found for model {model_name}")
     
     logger.info(f"Found {len(weight_files)} weight files for model {model_name}")
-    
-    # 3. 预先获取所有权重文件的元数据，避免在循环中重复访问ETCD
-    file_metadata_cache = {}
-    file_sizes = {}
-    file_server_info = {}
-    
-    for weight_file in weight_files:
-        metadata = _get_weight_file_metadata(etcd_client, weight_file)
-        if metadata:
-            file_metadata_cache[weight_file] = metadata
-            # 提取文件大小
-            file_size = (
-                metadata.get("size") or 
-                metadata.get("Size") or 
-                metadata.get("total_size") or 
-                metadata.get("TotalSize") or
-                1024 * 1024 * 100  # 默认100MB
-            )
-            file_sizes[weight_file] = file_size
-            
-            # 提取服务器信息和偏移量
-            server_info = _extract_server_info_from_metadata(metadata)
-            if server_info:
-                file_server_info[weight_file] = server_info
     
     # 根据文件大小降序排序权重文件，以优化文件系统操作（避免扩容）
     logger.info("Sorting weight files by size in descending order for performance optimization.")
@@ -246,13 +267,11 @@ def _wait_for_async_read_completion_optimized(rdma_client, batch_id):
     
     # 轮询等待传输完成
     while True:
-        logger.info("wait")
         status = rdma_client.get_batch_transfer_status([batch_id])
         if status == 0:  # 传输成功完成
             break
         elif status < 0:  # 传输失败
             raise RuntimeError(f"Async read failed with status {status}")
-        time.sleep(0.001)
 
 
 def _calculate_bandwidth(bytes_transferred: int, time_seconds: float) -> float:
@@ -572,35 +591,7 @@ def _connect_to_etcd(etcd_host: str, etcd_port: int):
         logger.error(f"ETCD connection failed: {e}")
         return None
 
-def _get_model_weight_files(etcd_client, model_name: str) -> List[str]:
-    """从ETCD获取模型的所有权重文件
-    
-    Args:
-        etcd_client: ETCD客户端实例
-        model_name: 模型名称
-        
-    Returns:
-        权重文件列表
-    """
-    logger.info(f"Querying weight files for model '{model_name}'...")
-    
-    try:
-        prefix = f"mooncake/checkpoint/{model_name}"
-        weight_files = []
-        
-        # 获取所有以模型名称为前缀的键
-        for value, metadata in etcd_client.get_prefix(prefix):
-            if metadata and hasattr(metadata, 'key'):
-                key = metadata.key.decode('utf-8')
-                # 只获取权重文件（以.safetensors结尾的文件）
-                if key.endswith('.safetensors'):
-                    weight_files.append(key)
-        
-        logger.info(f"Found {len(weight_files)} weight files")
-        return weight_files
-    except Exception as e:
-        logger.error(f"Error querying weight files: {e}")
-        return []
+
 
 
 def _get_weight_file_metadata(etcd_client, weight_file_key: str) -> Optional[Dict]:
