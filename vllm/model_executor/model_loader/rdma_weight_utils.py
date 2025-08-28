@@ -28,7 +28,7 @@ def rdma_safetensors_weights_iterator(
     etcd_host: str = "localhost",
     etcd_port: int = 2379,
 ) -> Generator[Tuple[str, torch.Tensor], None, None]:
-    """使用safetensors.load()从RDMA读取的数据加载权重（支持异步流水线处理）
+    """使用safetensors.load()从RDMA读取的数据加载权重
     
     Args:
         model_name: 模型名称
@@ -125,6 +125,10 @@ def _initialize_rdma_loading(
             server_info = _extract_server_info_from_metadata(metadata)
             if server_info:
                 file_server_info[weight_file] = server_info
+    
+    # 根据文件大小降序排序权重文件，以优化文件系统操作（避免扩容）
+    logger.info("Sorting weight files by size in descending order for performance optimization.")
+    weight_files.sort(key=lambda f: file_sizes.get(f, 0), reverse=True)
     
     # 4. 从权重文件中提取服务器信息
     servers = _extract_servers_from_weight_files_with_cache(etcd_client, weight_files, file_metadata_cache)
@@ -287,7 +291,6 @@ def _log_performance_metrics(operation: str, bytes_transferred: int, time_second
             logger.info(f"{operation} time spent: {time_seconds:.2f} seconds, {additional_info}")
         else:
             logger.info(f"{operation} time spent: {time_seconds:.2f} seconds")
-
 
 
 
@@ -486,9 +489,9 @@ def _read_weight_range_async_optimized(rdma_client, server_info, file_path, offs
     # 提交异步读取请求
     batch_id = rdma_client.batch_transfer_async_read(
         server_name,
-        [local_buffer_addr],    # 使用预注册内存的准确地址
-        [remote_buffer_addr],   # 远程地址不变
-        [length]                # 长度不变
+        [local_buffer_addr],
+        [remote_buffer_addr],
+        [length]    
     )
     
     if batch_id <= 0:
@@ -582,7 +585,6 @@ def _get_model_weight_files(etcd_client, model_name: str) -> List[str]:
     logger.info(f"Querying weight files for model '{model_name}'...")
     
     try:
-        # 构造前缀
         prefix = f"mooncake/checkpoint/{model_name}"
         weight_files = []
         
@@ -683,11 +685,11 @@ def _extract_servers_from_weight_files_with_cache(etcd_client, weight_files: Lis
     Returns:
         服务器信息列表
     """
-    servers = set()  # 使用集合避免重复
+    servers = set()
     
     logger.info("Extracting server information from weight file metadata (cached version)...")
     
-    # 遍历前几个权重文件以提取服务器信息（通常所有文件的服务器信息是相同的）
+    # 遍历前几个权重文件以提取服务器信息（目前假定所有文件的服务器信息是相同的）
     for i, weight_file_key in enumerate(weight_files[:3]):  # 只检查前3个文件
         logger.debug(f"  Checking weight file: {weight_file_key}")
         
@@ -1021,10 +1023,6 @@ def _load_weights_async_safe_open(
                 actual_file_size = os.path.getsize(shm_file_path)
                 logger.info(f"Shared memory file {shm_file_path} size: {actual_file_size} bytes, expected: {length} bytes")
 
-                # 如果文件大小为0，说明传输可能有问题
-                if actual_file_size == 0:
-                    raise RuntimeError(f"Shared memory file {shm_file_path} is empty")
-
                 # safe_open需要文件大小与safetensors元数据中的大小完全匹配。
                 # 我们的共享内存缓冲区是按最大文件大小预分配的，并且在流水线中重用。
                 # 这意味着支持文件的大小可能与上一个使用者的大小不匹配（可能更大或更小）。
@@ -1037,11 +1035,6 @@ def _load_weights_async_safe_open(
                     except OSError as e:
                         logger.error(f"Failed to resize shared memory file {shm_file_path}: {e}")
                         raise
-
-                # 增加一个最终检查，以确保文件大小现在是正确的
-                if actual_file_size != length:
-                    # This should not happen if truncate was successful
-                    raise RuntimeError(f"Shared memory file size {actual_file_size} still does not match expected size {length} after resizing.")
                 
                 # 使用safe_open直接从共享内存文件路径加载张量
                 tensor_count = 0
@@ -1078,10 +1071,7 @@ def _load_weights_async_safe_open(
                     next_server_info = file_server_info.get(next_weight_file, {"segment_name": server_name})
                     offset = next_server_info.get("offset", 0)
                     
-                    # 计算缓冲区索引
                     buffer_index = next_submit_index % pipeline_window_size
-                    
-                    # 直接从数组中获取缓冲区地址
                     buffer_ptr = buffer_ptrs[buffer_index]
                     
                     # 提交异步读取请求
