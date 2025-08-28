@@ -39,17 +39,17 @@ class RDMARemoteLoader(DefaultModelLoader):
                 "but is not available. Please install with Mooncake support.")
         
         self.mooncake_client = None
-        self.rank = self._get_worker_rank()
+        # self.rank = self._get_worker_rank()
         self._setup_mooncake_client()
         
-    def _get_worker_rank(self) -> int:
-        """Get worker rank from environment variables."""
-        # Try to get rank from different environment variables
-        # First try RANK (used by torchrun/torch.distributed)
-        # Then try LOCAL_RANK (used by some distributed training frameworks)
-        # Default to 0 if neither is set
-        rank = int(os.environ.get("RANK", os.environ.get("LOCAL_RANK", "0")))
-        return rank
+    # def _get_worker_rank(self) -> int:
+    #     """Get worker rank from environment variables."""
+    #     # Try to get rank from different environment variables
+    #     # First try RANK (used by torchrun/torch.distributed)
+    #     # Then try LOCAL_RANK (used by some distributed training frameworks)
+    #     # Default to 0 if neither is set
+    #     rank = int(os.environ.get("RANK", os.environ.get("LOCAL_RANK", "0")))
+    #     return rank
 
     def _prepare_weights(self, model_name_or_path: str, revision: Optional[str], 
                         fall_back_to_pt: bool, allow_patterns_overrides: Optional[list[str]]) -> tuple[str, list[str], bool]:
@@ -105,15 +105,13 @@ class RDMARemoteLoader(DefaultModelLoader):
     def _setup_mooncake_client(self) -> None:
         """Initialize Mooncake client for RDMA transfers."""
         try:
-            # Get distributed rank for port allocation
-            rank = self.rank
-            local_rank = int(os.environ.get("LOCAL_RANK", "0"))
+            # 使用动态端口分配来避免多进程环境中的端口冲突。
+            # 通过绑定到端口0，我们让操作系统选择一个可用的临时端口。
+            # Mooncake客户端应该处理向元数据服务器（ETCD）注册其实际分配的端口，
+            # 以便其他客户端可以发现它。
+            port = 0
             
-            # Use KV transfer pattern: base_port + rank
-            base_port = 9876
-            port = base_port + rank
-            
-            logger.info(f"Setting up Mooncake client for rank {rank} on port {port}")
+            logger.info(f"Setting up Mooncake client using dynamic port allocation (port=0)")
             
             # Get RDMA configuration
             rdma_config = self.load_config.model_loader_extra_config.get("rdma", {})
@@ -129,14 +127,14 @@ class RDMARemoteLoader(DefaultModelLoader):
             # Parameters for initialize(): local_hostname, metadata_server, protocol, device_name
             self.mooncake_client = TransferEngine()
             ret = self.mooncake_client.initialize(
-                f"localhost:{port}",  # local_hostname
+                f"localhost:{port}",  # local_hostname with port 0 for dynamic allocation
                 metadata_server,      # metadata_server (ETCD connection string)
                 "rdma",               # protocol
                 ""                    # device_name (empty for all devices)
             )
             if ret != 0:
                 raise RuntimeError(f"Failed to initialize Mooncake Transfer Engine with code {ret}")
-            logger.info(f"Initialized Mooncake client on port {port} for rank {rank}")
+            logger.info(f"Initialized Mooncake client on an OS-assigned port")
             
         except Exception as e:
             logger.error(f"Failed to initialize Mooncake client: {e}")
