@@ -7,7 +7,7 @@ from collections.abc import Generator
 from typing import Dict, Any, Tuple, List, Optional
 
 import torch
-from safetensors.torch import load
+from safetensors.torch import load, safe_open
 
 from vllm.logger import init_logger
 from vllm.model_executor.model_loader.rdma_buffer_manager import RDMABufferManager
@@ -45,10 +45,11 @@ def rdma_safetensors_weights_iterator(
     # 从环境变量获取配置
     use_async = os.getenv("VLLM_RDMA_ASYNC_LOADING", "false").lower() in ("true", "1", "yes")
     use_batch = os.getenv("VLLM_RDMA_BATCH_LOADING", "false").lower() in ("true", "1", "yes")
+    use_safe_open = os.getenv("VLLM_RDMA_SAFE_OPEN_LOADING", "false").lower() in ("true", "1", "yes")
     pipeline_window_size = int(os.getenv("VLLM_RDMA_PIPELINE_WINDOW_SIZE", "3"))
     
     logger.info(f"Starting RDMA weight loading for model: {model_name}")
-    logger.info(f"Async loading: {use_async}, Batch loading: {use_batch}, Pipeline window size: {pipeline_window_size}")
+    logger.info(f"Async loading: {use_async}, Batch loading: {use_batch}, SafeOpen loading: {use_safe_open}, Pipeline window size: {pipeline_window_size}")
     
     # 初始化RDMA加载
     init_result = _initialize_rdma_loading(etcd_host, etcd_port, model_name)
@@ -60,17 +61,20 @@ def rdma_safetensors_weights_iterator(
             rdma_client, weight_files, file_sizes, file_server_info, 
             server_name
         )
-    # 如果不使用异步加载，回退到原来的同步实现
-    elif not use_async:
-        yield from _load_weights_sync(
+    elif use_safe_open:
+        yield from _load_weights_async_safe_open(
             rdma_client, weight_files, file_sizes, file_server_info, 
-            server_name
+            server_name, pipeline_window_size
         )
-    else:
-        # 异步流水线处理实现
+    elif use_async:
         yield from _load_weights_async(
             rdma_client, weight_files, file_sizes, file_server_info, 
             server_name, pipeline_window_size
+        )
+    else:
+        yield from _load_weights_sync(
+            rdma_client, weight_files, file_sizes, file_server_info, 
+            server_name
         )
     
     logger.info(f"Completed RDMA weight loading for model: {model_name}")
@@ -153,7 +157,6 @@ def _load_weights_sync(
     # 记录初始化缓冲区时间
     init_start_time = time.perf_counter()
     
-    # 为同步加载初始化单个预注册缓冲区（窗口大小为1）
     max_file_size = max(file_sizes.values()) if file_sizes else 1024 * 1024 * 100
     # 创建缓冲区管理器实例
     buffer_manager = RDMABufferManager()
@@ -176,18 +179,14 @@ def _load_weights_sync(
         logger.info(f"Loading weights from {weight_file} via RDMA (sync with pre-registered buffer)")
         
         try:
-            # 记录开始时间
             transfer_start_time = time.perf_counter()
             
-            # 从缓存中获取文件大小和服务器信息
             file_size = file_sizes.get(weight_file, 1024 * 1024 * 100)  # 默认100MB
             server_info = file_server_info.get(weight_file, {"segment_name": server_name})
             offset = server_info.get("offset", 0)
             
-            # 强制使用预注册内存的方法读取数据
             file_data = _read_weight_range_optimized(rdma_client, server_info, weight_file, offset, file_size, sync_buffer, sync_buffer_ptr)
             
-            # 记录结束时间和计算带宽
             transfer_end_time = time.perf_counter()
             transfer_time = transfer_end_time - transfer_start_time
             total_transfer_time += transfer_time
@@ -207,7 +206,6 @@ def _load_weights_sync(
             
             _log_performance_metrics("File load", len(file_data), load_time, f"file: {weight_file}")
             
-            # 产出所有张量（跳过元数据）
             tensor_count = 0
             for name, tensor in tensors.items():
                 if name != "__metadata__":
@@ -239,7 +237,7 @@ class AsyncReadTaskOptimized:
 
 
 def _wait_for_async_read_completion_optimized(rdma_client, batch_id):
-    """优化的等待异步读取完成函数，避免二次拷贝"""
+    """等待异步读取完成函数"""
     import time
     
     # 轮询等待传输完成
@@ -250,7 +248,7 @@ def _wait_for_async_read_completion_optimized(rdma_client, batch_id):
             break
         elif status < 0:  # 传输失败
             raise RuntimeError(f"Async read failed with status {status}")
-        time.sleep(0.001)  # 1ms
+        time.sleep(0.001)
 
 
 def _calculate_bandwidth(bytes_transferred: int, time_seconds: float) -> float:
@@ -301,7 +299,7 @@ def _load_weights_async(
     server_name: str,
     pipeline_window_size: int
 ) -> Generator[Tuple[str, torch.Tensor], None, None]:
-    """异步加载权重文件（优化版）
+    """异步加载权重文件
     Yields:
         Tuples of (weight_name, weight_tensor)
     """
@@ -399,6 +397,8 @@ def _load_weights_async(
                 
                 buffer = buffer_manager.buffers[buffer_index]
                 file_data = buffer[:length].tobytes()
+                # file_data = memoryview(buffer)[:length].tobytes()
+                # file_data = memoryview(buffer.data)[0:length]
                 
                 # 记录结束时间和计算带宽
                 transfer_end_time = time.perf_counter()
@@ -411,7 +411,6 @@ def _load_weights_async(
                 # 记录safetensors.load()时间
                 load_start_time = time.perf_counter()
                 
-                # 使用safetensors.load()从内存数据加载所有张量
                 tensors = load(file_data)
                 
                 load_end_time = time.perf_counter()
@@ -507,8 +506,7 @@ def _read_weight_range_optimized(
     buffer: Any,
     buffer_ptr: int
 ) -> bytes:
-    """优化版本的读取远程文件数据范围函数，使用预注册缓冲区避免重复内存注册和二次拷贝
-    
+    """
     Args:
         rdma_client: Mooncake Transfer Engine client
         server_info: Server information
@@ -544,7 +542,6 @@ def _read_weight_range_optimized(
         if ret != 0:
             raise RuntimeError(f"RDMA read failed for {file_path} offset {offset} length {length} with code {ret}")
         
-        # 直接从预注册缓冲区返回数据，避免二次拷贝
         data = buffer[:length].tobytes()
         logger.debug(f"Successfully read {len(data)} bytes from {file_path} using pre-registered buffer")
         return data
@@ -881,14 +878,15 @@ def _load_weights_batch(
             logger.info(f"Loading tensors from {weight_file}")
             
             try:
-                # 直接从预注册缓冲区numpy数组返回数据视图，避免二次拷贝
+                copy_start_time = time.perf_counter()
                 buffer = buffers[file_index]
                 file_data = buffer[:file_size].tobytes()
-                
+                copy_end_time = time.perf_counter()
+                _log_performance_metrics("File copy", len(file_data), copy_end_time - copy_start_time, f"file: {weight_file}")
+
                 # 记录safetensors.load()时间
                 load_start_time = time.perf_counter()
                 
-                # 使用safetensors.load()从内存数据加载所有张量
                 tensors = load(file_data)
                 
                 load_end_time = time.perf_counter()
@@ -898,7 +896,6 @@ def _load_weights_batch(
                 
                 _log_performance_metrics("File load", len(file_data), load_time, f"file: {weight_file}")
                 
-                # 产出所有张量（跳过元数据）
                 tensor_count = 0
                 for name, tensor in tensors.items():
                     if name != "__metadata__":
@@ -918,3 +915,206 @@ def _load_weights_batch(
         buffer_manager.cleanup()
         
     logger.info("Completed batch weight loading")
+
+
+def _load_weights_async_safe_open(
+    rdma_client: Any,
+    weight_files: List[str],
+    file_sizes: Dict[str, int],
+    file_server_info: Dict[str, Dict],
+    server_name: str,
+    pipeline_window_size: int
+) -> Generator[Tuple[str, torch.Tensor], None, None]:
+    """使用共享内存和safe_open的异步加载权重文件实现
+    
+    Yields:
+        Tuples of (weight_name, weight_tensor)
+    """
+    import time
+    from collections import deque
+    import os
+    
+    # 记录初始化缓冲区时间
+    init_start_time = time.perf_counter()
+    
+    # 初始化共享内存缓冲区
+    max_file_size = max(file_sizes.values()) if file_sizes else 1024 * 1024 * 100
+    # 创建缓冲区管理器实例，使用共享内存
+    buffer_manager = RDMABufferManager()
+    try:
+        buffer_manager.initialize(rdma_client, max_file_size, pipeline_window_size, use_shared_memory=True)
+        buffer_ptrs = buffer_manager.buffer_ptrs
+        shared_memory_names = buffer_manager.shared_memory_names
+    except Exception as e:
+        raise RuntimeError(f"Failed to initialize buffer manager for async safe_open loading: {e}")
+    
+    init_end_time = time.perf_counter()
+    init_time = init_end_time - init_start_time
+    _log_performance_metrics("Shared memory initialization", 0, init_time)
+    
+    # 使用双端队列存储正在进行的任务
+    active_tasks = deque()
+    
+    try:
+        # 提交初始窗口大小的异步读取请求
+        for i in range(min(pipeline_window_size, len(weight_files))):
+            weight_file = weight_files[i]
+            file_size = file_sizes.get(weight_file, 1024 * 1024 * 100)
+            server_info = file_server_info.get(weight_file, {"segment_name": server_name})
+            offset = server_info.get("offset", 0)
+            
+            # 直接从数组中获取缓冲区地址
+            buffer_ptr = buffer_ptrs[i]
+            
+            # 提交异步读取请求，直接读取到共享内存
+            try:
+                batch_id, returned_buffer_addr, length = _read_weight_range_async_optimized(
+                    rdma_client, server_info, weight_file, offset, file_size,
+                    buffer_ptr
+                )
+                
+                active_tasks.append(AsyncReadTaskOptimized(
+                    weight_file=weight_file,
+                    batch_id=batch_id,
+                    buffer_addr=returned_buffer_addr,
+                    buffer_index=i,  # 存储缓冲区索引
+                    length=length,
+                    server_info=server_info
+                ))
+            except Exception as e:
+                logger.error(f"Failed to submit async read request for {weight_file}: {e}")
+                raise
+
+        # 处理所有权重文件
+        next_submit_index = pipeline_window_size
+        total_bytes = 0
+        total_transfer_time = 0.0
+        total_load_time = 0.0
+        
+        # 继续处理直到所有任务完成
+        while active_tasks:
+            # 获取最早提交的任务
+            current_task = active_tasks.popleft()
+            weight_file = current_task.weight_file
+            batch_id = current_task.batch_id
+            buffer_index = current_task.buffer_index
+            length = current_task.length
+            server_info = current_task.server_info
+            
+            logger.info(f"Processing weights from {weight_file} via RDMA with safe_open")
+            
+            try:
+                # 等待当前文件传输完成
+                _wait_for_async_read_completion_optimized(rdma_client, batch_id)
+                
+                # 记录safe_open时间
+                load_start_time = time.perf_counter()
+                
+                # 直接使用共享内存文件路径，避免内存拷贝
+                shm_file_path = f"/dev/shm/{shared_memory_names[buffer_index]}"
+                
+                # 检查共享内存文件是否存在以及大小是否正确
+                if not os.path.exists(shm_file_path):
+                    raise RuntimeError(f"Shared memory file {shm_file_path} does not exist")
+                
+                # 获取文件大小
+                actual_file_size = os.path.getsize(shm_file_path)
+                logger.info(f"Shared memory file {shm_file_path} size: {actual_file_size} bytes, expected: {length} bytes")
+
+                # 如果文件大小为0，说明传输可能有问题
+                if actual_file_size == 0:
+                    raise RuntimeError(f"Shared memory file {shm_file_path} is empty")
+
+                # safe_open需要文件大小与safetensors元数据中的大小完全匹配。
+                # 我们的共享内存缓冲区是按最大文件大小预分配的，并且在流水线中重用。
+                # 这意味着支持文件的大小可能与上一个使用者的大小不匹配（可能更大或更小）。
+                # 因此，我们必须在每次使用前将文件调整为确切的预期大小。
+                if actual_file_size != length:
+                    logger.info(f"Resizing shared memory file {shm_file_path} from {actual_file_size} to {length} bytes")
+                    try:
+                        os.truncate(shm_file_path, length)
+                        actual_file_size = length  # 更新文件大小变量
+                    except OSError as e:
+                        logger.error(f"Failed to resize shared memory file {shm_file_path}: {e}")
+                        raise
+
+                # 增加一个最终检查，以确保文件大小现在是正确的
+                if actual_file_size != length:
+                    # This should not happen if truncate was successful
+                    raise RuntimeError(f"Shared memory file size {actual_file_size} still does not match expected size {length} after resizing.")
+                
+                # 使用safe_open直接从共享内存文件路径加载张量
+                tensor_count = 0
+                try:
+                    with safe_open(shm_file_path, framework="pt", device="cpu") as f:
+                        for name in f.keys():
+                            if name != "__metadata__":
+                                tensor = f.get_tensor(name)
+                                yield name, tensor
+                                tensor_count += 1
+                except Exception as e:
+                    logger.error(f"Failed to load tensors from {shm_file_path} with safe_open: {e}")
+                    logger.error(f"File size: {actual_file_size}, Expected size: {length}")
+                    # 检查文件头几个字节以帮助诊断问题
+                    try:
+                        with open(shm_file_path, 'rb') as debug_f:
+                            header_data = debug_f.read(1024)  # 读取前1024字节
+                            logger.error(f"First 1024 bytes of file (hex): {header_data.hex()}")
+                    except Exception as debug_e:
+                        logger.error(f"Failed to read file for debugging: {debug_e}")
+                    raise
+                
+                load_end_time = time.perf_counter()
+                load_time = load_end_time - load_start_time
+                total_load_time += load_time
+                
+                _log_performance_metrics("File load", length, load_time, f"file: {weight_file}")
+                logger.info(f"Loaded {tensor_count} tensors from {weight_file} using safe_open with shared memory")
+                
+                # 如果还有文件需要预取，提交新的异步读取请求
+                if next_submit_index < len(weight_files):
+                    next_weight_file = weight_files[next_submit_index]
+                    file_size = file_sizes.get(next_weight_file, 1024 * 1024 * 100)
+                    next_server_info = file_server_info.get(next_weight_file, {"segment_name": server_name})
+                    offset = next_server_info.get("offset", 0)
+                    
+                    # 计算缓冲区索引
+                    buffer_index = next_submit_index % pipeline_window_size
+                    
+                    # 直接从数组中获取缓冲区地址
+                    buffer_ptr = buffer_ptrs[buffer_index]
+                    
+                    # 提交异步读取请求
+                    try:
+                        batch_id, returned_buffer_addr, actual_length = _read_weight_range_async_optimized(
+                            rdma_client, next_server_info, next_weight_file, offset, file_size,
+                            buffer_ptr
+                        )
+                        
+                        # 将新任务添加到队列末尾
+                        active_tasks.append(AsyncReadTaskOptimized(
+                            weight_file=next_weight_file,
+                            batch_id=batch_id,
+                            buffer_addr=returned_buffer_addr,
+                            buffer_index=buffer_index,
+                            length=actual_length,  # 使用实际长度
+                            server_info=next_server_info
+                        ))
+                    except Exception as e:
+                        logger.error(f"Failed to submit async read request for {next_weight_file}: {e}")
+                        raise
+                    
+                    next_submit_index += 1
+                    
+            except Exception as e:
+                logger.error(f"Failed to load weights from {weight_file}: {e}")
+                raise
+                
+    finally:
+        # 清理缓冲区管理器
+        buffer_manager.cleanup()
+    
+    # 计算总体带宽
+    _log_performance_metrics("Overall async loading transfer", total_bytes, total_transfer_time)
+    _log_performance_metrics("Overall async loading load", total_bytes, total_load_time)
+

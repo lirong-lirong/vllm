@@ -5,6 +5,7 @@
 import logging
 from typing import List, Tuple, Optional
 import numpy as np
+import multiprocessing.shared_memory as shm
 
 logger = logging.getLogger(__name__)
 
@@ -20,9 +21,12 @@ class RDMABufferManager:
         """初始化RDMA缓冲区管理器."""
         self._buffers: List[np.ndarray] = []
         self._buffer_ptrs: List[int] = []
+        self._shared_memory_objects: List[shm.SharedMemory] = []
+        self._shared_memory_names: List[str] = []
         self._max_file_size: int = 0
         self._pipeline_window_size: int = 0
         self._is_initialized: bool = False
+        self._use_shared_memory: bool = False
         self._rdma_client = None
     
     @property
@@ -50,13 +54,24 @@ class RDMABufferManager:
         """获取流水线窗口大小."""
         return self._pipeline_window_size
     
-    def initialize(self, rdma_client: object, max_file_size: int, pipeline_window_size: int) -> None:
+    @property
+    def use_shared_memory(self) -> bool:
+        """检查是否使用共享内存."""
+        return self._use_shared_memory
+    
+    @property
+    def shared_memory_names(self) -> List[str]:
+        """获取共享内存名称列表."""
+        return self._shared_memory_names
+    
+    def initialize(self, rdma_client: object, max_file_size: int, pipeline_window_size: int, use_shared_memory: bool = False) -> None:
         """初始化持久化预注册缓冲区.
         
         Args:
             rdma_client: RDMA客户端实例
             max_file_size: 最大文件大小（字节）
             pipeline_window_size: 流水线窗口大小
+            use_shared_memory: 是否使用共享内存
             
         Raises:
             RuntimeError: 当缓冲区初始化失败时抛出
@@ -68,20 +83,46 @@ class RDMABufferManager:
         self._rdma_client = rdma_client
         self._max_file_size = max_file_size
         self._pipeline_window_size = pipeline_window_size
+        self._use_shared_memory = use_shared_memory
         
         try:
             # 为每个流水线槽位分配单独的缓冲区
             self._buffers = []
             self._buffer_ptrs = []
+            self._shared_memory_objects = []
+            self._shared_memory_names = []
             
-            # 先分配所有缓冲区
-            for i in range(self._pipeline_window_size):
-                # 预分配缓冲区
-                buffer = np.empty(self._max_file_size, dtype=np.uint8)
-                buffer_ptr = buffer.ctypes.data
+            if use_shared_memory:
+                # 创建共享内存缓冲区
+                import uuid
+                for i in range(self._pipeline_window_size):
+                    # 生成唯一的共享内存名称
+                    shm_name = f"vllm_rdma_shm_{uuid.uuid4().hex}_{i}"
+                    # 创建共享内存对象
+                    shm_obj = shm.SharedMemory(create=True, size=self._max_file_size, name=shm_name)
+                    # 将共享内存包装为numpy数组以便操作 []
+                    shared_buffer = np.ndarray(shape=(self._max_file_size,), dtype=np.uint8, buffer=shm_obj.buf)
+                    # shared_buffer = np.frombuffer(shm.buf, dtype=np.uint8) 
+                    # 保存共享内存对象引用，防止被垃圾回收
+                    self._shared_memory_objects.append(shm_obj)
+                    self._shared_memory_names.append(shm_name)
+                    
+                    # 获取共享内存缓冲区的地址
+                    # import ctypes
+                    # buffer_ptr = ctypes.addressof(ctypes.c_char.from_buffer(shm_obj.buf))
+                    buffer_ptr = shared_buffer.ctypes.data
+                    self._buffer_ptrs.append(buffer_ptr)
                 
-                self._buffers.append(buffer)
-                self._buffer_ptrs.append(buffer_ptr)
+                logger.info(f"Created {self._pipeline_window_size} shared memory buffers of size {self._max_file_size} bytes each")
+            else:
+                # 先分配所有缓冲区
+                for i in range(self._pipeline_window_size):
+                    # 预分配缓冲区
+                    buffer = np.empty(self._max_file_size, dtype=np.uint8)
+                    buffer_ptr = buffer.ctypes.data
+                    
+                    self._buffers.append(buffer)
+                    self._buffer_ptrs.append(buffer_ptr)
             
             # 批量注册所有内存
             capacities = [self._max_file_size] * len(self._buffer_ptrs)
@@ -166,10 +207,22 @@ class RDMABufferManager:
         self._buffers.clear()
         self._buffer_ptrs.clear()
         
+        # 清理共享内存对象
+        if self._use_shared_memory:
+            for shm_obj in self._shared_memory_objects:
+                try:
+                    shm_obj.close()
+                    shm_obj.unlink()
+                except Exception as e:
+                    logger.warning(f"Failed to clean up shared memory object: {e}")
+            self._shared_memory_objects.clear()
+            self._shared_memory_names.clear()
+        
         # 重置状态
         self._max_file_size = 0
         self._pipeline_window_size = 0
         self._is_initialized = False
+        self._use_shared_memory = False
         self._rdma_client = None
         
         logger.info("RDMA buffer manager cleaned up")
